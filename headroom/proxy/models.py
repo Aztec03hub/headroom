@@ -407,6 +407,17 @@ class ProxyConfig:
     # See headroom/proxy/buffered_ccr_response.py (#3079).
     buffered_ccr_grace_seconds: float = DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 
+    # Buffered CCR for /v1/chat/completions streaming. Off by default: this is
+    # the one streaming path with no way to intercept a tool call, so CCR has
+    # been unavailable there (markers in content, no `headroom_retrieve` in
+    # tools) and the tool toggles in and out for sessions that mix streaming
+    # with non-streaming turns, busting the tools cache segment each way.
+    # Enabling it flips the turn to `stream: false` upstream and resynthesizes
+    # chat.completion.chunk frames, the same shape the Responses streaming path
+    # already uses. Default off because this is the most incident-prone path in
+    # the proxy (#2465, #2997, #3079) — turn it on deliberately.
+    ccr_buffered_chat_streaming: bool = False
+
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100

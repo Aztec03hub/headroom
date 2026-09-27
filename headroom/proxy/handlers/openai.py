@@ -1236,16 +1236,61 @@ def _should_buffer_openai_responses_stream_ccr(
     )
 
 
-def _should_inject_openai_chat_ccr_tool(*, ccr_inject_tool: bool, stream: bool) -> bool:
+def _should_inject_openai_chat_ccr_tool(
+    *, ccr_inject_tool: bool, stream: bool, buffered: bool = False
+) -> bool:
     """Return whether chat-completions can redeem an injected CCR tool.
 
-    The chat streaming path forwards SSE events immediately and deliberately
-    does not run the response continuation loop. Injecting ``headroom_retrieve``
-    there makes OpenAI-compatible clients attempt an unknown tool call. The
+    A plain chat streaming turn forwards SSE events immediately and does not run
+    the response continuation loop, so injecting ``headroom_retrieve`` there
+    makes OpenAI-compatible clients attempt an unknown tool call. The
     non-streaming path can intercept and resolve it; Responses streaming has a
     separate buffered-CCR path and is unaffected by this predicate.
+
+    ``buffered`` is the third case: the turn was flipped to ``stream: false``
+    upstream and will be resynthesized as SSE, so the continuation loop *does*
+    run and the tool is redeemable. Deciding this before injection is what
+    breaks the ordering deadlock — the Responses gate keys on the tool already
+    being present in ``tools``, which on chat it never is precisely because
+    this predicate said no.
     """
-    return bool(ccr_inject_tool and not stream)
+    return bool(ccr_inject_tool and (buffered or not stream))
+
+
+def _should_buffer_openai_chat_stream_ccr(
+    *,
+    stream: bool,
+    enabled: bool,
+    ccr_response_handler_enabled: bool,
+    ccr_inject_tool: bool,
+    tools: Any,
+    upstream_base_url: str | None = None,
+) -> bool:
+    """Return whether a streaming chat turn should run as buffered CCR.
+
+    Unlike :func:`_should_buffer_openai_responses_stream_ccr` this cannot key on
+    ``headroom_retrieve`` already being in ``tools``: on this path the tool has
+    never been injected, so that test would never pass and the mode would be
+    unreachable. It keys on configuration instead, and injection is then allowed
+    by :func:`_should_inject_openai_chat_ccr_tool`.
+
+    Requiring a non-empty client ``tools`` array keeps the rule from #3810: a
+    request with no tools is not an agent harness, has no tool results to
+    compress, and must not be handed a tools array it never sent.
+
+    OpenCode Zen rejects requests Headroom has reshaped (``stream:false`` plus
+    ``accept: application/json``) with ``403 FreeTierError`` (#3656), so that
+    gateway keeps its client's streaming request untouched.
+    """
+
+    return bool(
+        stream
+        and enabled
+        and ccr_response_handler_enabled
+        and ccr_inject_tool
+        and tools
+        and not is_opencode_zen_base(upstream_base_url)
+    )
 
 
 def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
@@ -4147,14 +4192,33 @@ class OpenAIHandlerMixin:
         # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
+        # Decided BEFORE injection: a buffered turn runs the continuation loop,
+        # so the retrieval tool is redeemable and may be injected even though
+        # the client asked for a stream. See
+        # `_should_buffer_openai_chat_stream_ccr` for why this cannot key on the
+        # tool already being present the way the Responses gate does.
+        buffered_chat_ccr = _should_buffer_openai_chat_stream_ccr(
+            stream=stream,
+            enabled=bool(getattr(self.config, "ccr_buffered_chat_streaming", False)),
+            ccr_response_handler_enabled=self.ccr_response_handler is not None,
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            tools=tools,
+            upstream_base_url=upstream_base_url,
+        )
+        if buffered_chat_ccr:
+            logger.info(
+                f"[{request_id}] CCR: buffering streaming chat turn "
+                "(stream:false upstream, resynthesized as chat.completion.chunk)"
+            )
         can_inject_ccr_tool = _should_inject_openai_chat_ccr_tool(
             ccr_inject_tool=self.config.ccr_inject_tool,
             stream=stream,
+            buffered=buffered_chat_ccr,
         )
         if (
             self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
         ) and not _bypass:
-            if self.config.ccr_inject_tool and stream:
+            if self.config.ccr_inject_tool and stream and not buffered_chat_ccr:
                 logger.info(
                     f"[{request_id}] CCR: skipping retrieval-tool injection for "
                     "OpenAI chat streaming; this path cannot intercept tool calls"
@@ -4163,7 +4227,7 @@ class OpenAIHandlerMixin:
                 provider="openai",
                 inject_tool=False,  # routed through sticky helper below
                 inject_system_instructions=(
-                    self.config.ccr_inject_system_instructions and not stream
+                    self.config.ccr_inject_system_instructions and (not stream or buffered_chat_ccr)
                 ),
             )
             injector.scan_for_markers(optimized_messages)
@@ -4173,7 +4237,7 @@ class OpenAIHandlerMixin:
             injector.verify_ownership()
             if (
                 self.config.ccr_inject_system_instructions
-                and not stream
+                and (not stream or buffered_chat_ccr)
                 and injector.has_compressed_content
             ):
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
