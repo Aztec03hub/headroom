@@ -22,8 +22,11 @@ tower = { workspace = true }
 tower-http = { version = "0.7", features = ["trace", "request-id", "util"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Native roots on top of the bundled webpki set: corporate TLS-inspection
+# roots (Zscaler, Netskope, ...) are installed in the OS store, never in
+# Mozilla's list, so webpki alone rejects every re-signed upstream certificate.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "rustls-tls-native-roots", "http2"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
