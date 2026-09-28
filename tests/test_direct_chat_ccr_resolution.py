@@ -22,6 +22,7 @@ division the turn-hook re-drive path already uses via `TurnHookUsage`.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -114,7 +115,33 @@ def _final_response() -> dict:
     }
 
 
-def _run(upstream_sequence: list) -> tuple[httpx.Response, list[dict], list]:
+class _CollectHandler(logging.Handler):
+    """Collect `headroom.*` records regardless of propagation.
+
+    `caplog` attaches to the root logger, but the proxy's own startup
+    (`helpers._setup_file_logging`) sets `propagate = False` on `headroom`, so
+    records never reach root — and it does that *during* `create_app`, after
+    conftest's autouse reset has already run. A handler on the `headroom`
+    logger itself still fires, because `propagate` only governs whether records
+    are passed further up. Anything asserting on log contents here has to go
+    through this, or it silently asserts against an empty string.
+    """
+
+    def __init__(self, sink: list[str]) -> None:
+        super().__init__(level=logging.DEBUG)
+        self._sink = sink
+        self.setFormatter(logging.Formatter("%(name)s %(levelname)s %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._sink.append(self.format(record))
+        except Exception:  # pragma: no cover - a test handler must not raise
+            pass
+
+
+def _run(
+    upstream_sequence: list, log_capture: list[str] | None = None
+) -> tuple[httpx.Response, list[dict], list]:
     """Post one chat turn, serving `upstream_sequence` to successive calls.
 
     Each entry is either a payload dict (served as `200`) or an explicit
@@ -168,21 +195,34 @@ def _run(upstream_sequence: list) -> tuple[httpx.Response, list[dict], list]:
 
         proxy._record_request_outcome = _capture
 
-        resp = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": "how many rows?"}],
-                "stream": False,
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {"name": "Read", "description": "read a file"},
-                    }
-                ],
-            },
-            headers={"Authorization": "Bearer test-key", "x-api-key": "test-key"},
-        )
+        # After startup, so the proxy's own logging setup cannot undo it.
+        _handler: logging.Handler | None = None
+        if log_capture is not None:
+            _headroom_logger = logging.getLogger("headroom")
+            _headroom_logger.disabled = False
+            _headroom_logger.setLevel(logging.DEBUG)
+            _handler = _CollectHandler(log_capture)
+            _headroom_logger.addHandler(_handler)
+
+        try:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "how many rows?"}],
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "Read", "description": "read a file"},
+                        }
+                    ],
+                },
+                headers={"Authorization": "Bearer test-key", "x-api-key": "test-key"},
+            )
+        finally:
+            if _handler is not None:
+                logging.getLogger("headroom").removeHandler(_handler)
         return resp, sent, outcomes
 
 
@@ -232,6 +272,54 @@ def test_the_forwarded_body_keeps_the_provider_usage_untouched():
 
 
 ERROR_BODY = {"error": {"message": "invalid api key", "type": "invalid_request_error"}}
+
+# A value that must never be logged. Upstream error bodies are untrusted and
+# routinely carry credential fragments, tenant identifiers and excerpts of the
+# request that produced them.
+SENTINEL = "sk-live-SENTINEL-must-never-be-logged-8f3a1c"
+ERROR_BODY_WITH_SECRET = {
+    "error": {
+        "message": f"authentication failed for key {SENTINEL} (tenant acme-prod-42)",
+        "type": "invalid_request_error",
+    }
+}
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_a_failed_continuation_body_never_reaches_the_logs(status):
+    """The status is diagnostic enough; the body is untrusted content.
+
+    Two paths would leak it, and both have to stay closed:
+
+    * anything this module logs itself, and
+    * the exception's own message — `handle_response` logs `repr(e)` when a
+      continuation raises (`ccr/response_handler.py:541`), so a preview placed
+      on the exception reaches the log even if this module never logs it.
+
+    The positive assertion at the end is load-bearing: it is what proves the
+    capture is actually wired to the `headroom` logger. Without it the negative
+    assertions pass against an empty string and the test is worthless.
+    """
+    hash_key = _stored_hash()
+    logs: list[str] = []
+    resp, sent, _outcomes = _run(
+        [_retrieve_call_response(hash_key), (status, ERROR_BODY_WITH_SECRET)],
+        log_capture=logs,
+    )
+    text = "\n".join(logs)
+
+    assert len(sent) == 2, "the continuation should still have been attempted"
+    # Proves the capture works, so the assertions below mean something.
+    assert f"HTTP {status}" in text, (
+        f"the {status} status was not logged, so either the failure is invisible "
+        "or this test is not capturing headroom's logs at all"
+    )
+    assert SENTINEL not in text, (
+        "an upstream error body reached the logs; even a bounded prefix is an "
+        "exfiltration path for credentials and tenant identifiers"
+    )
+    assert "acme-prod-42" not in text, "a tenant identifier reached the logs"
+    assert SENTINEL not in resp.text, "the upstream error body reached the client"
 
 
 @pytest.mark.parametrize(

@@ -302,12 +302,19 @@ class CCRContinuationHTTPError(Exception):
     path, which forwards the response it already had. That keeps one behaviour
     for every way a continuation can fail: transport error, timeout, and now
     an error status.
+
+    Carries the status and nothing else. An upstream error body is untrusted
+    content that routinely contains credential fragments, tenant identifiers
+    and excerpts of the request, and the status alone identifies the failure.
+    The message matters as much as any explicit log call: ``handle_response``
+    logs ``repr(e)`` when a continuation raises
+    (``ccr/response_handler.py:541``), so anything placed here reaches the log
+    whether or not this module logs it too.
     """
 
-    def __init__(self, status_code: int, body_preview: str) -> None:
-        super().__init__(f"CCR continuation returned HTTP {status_code}: {body_preview}")
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"CCR continuation returned HTTP {status_code}")
         self.status_code = status_code
-        self.body_preview = body_preview
 
 
 class TurnHookUsage:
@@ -5293,7 +5300,7 @@ class OpenAIHandlerMixin:
                 # let retrieval hide its own cost, which is the mistake the
                 # matching comment on the re-drive block below warns about.
                 _ccr_final_json: dict[str, Any] | None = None
-                _ccr_cont_error: tuple[int, str] | None = None
+                _ccr_cont_error: int | None = None
                 if self.ccr_response_handler is not None and response.status_code == 200:
                     try:
                         _pre_ccr_json = response.json()
@@ -5341,8 +5348,10 @@ class OpenAIHandlerMixin:
                             # reaches the client as HTTP 200 carrying an error
                             # object.
                             if not 200 <= cont.status_code < 300:
-                                _ccr_cont_error = (cont.status_code, cont.text[:200])
-                                raise CCRContinuationHTTPError(*_ccr_cont_error)
+                                # Status only. The body is untrusted upstream
+                                # content and never leaves this branch.
+                                _ccr_cont_error = cont.status_code
+                                raise CCRContinuationHTTPError(cont.status_code)
                             cont_json: dict[str, Any] = cont.json()
                             _hook_usage.record(cont_json, **CHAT_USAGE_KEYS)
                             return cont_json
@@ -5370,8 +5379,8 @@ class OpenAIHandlerMixin:
                                 if _ccr_cont_error is not None:
                                     logger.warning(
                                         f"[{request_id}] CCR: continuation returned HTTP "
-                                        f"{_ccr_cont_error[0]}; forwarding the upstream reply "
-                                        f"unchanged (body: {_ccr_cont_error[1]!r})"
+                                        f"{_ccr_cont_error}; forwarding the upstream reply "
+                                        "unchanged"
                                     )
                                 else:
                                     logger.warning(
