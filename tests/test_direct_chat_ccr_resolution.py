@@ -114,8 +114,13 @@ def _final_response() -> dict:
     }
 
 
-def _run(upstream_sequence: list[dict]) -> tuple[httpx.Response, list[dict], list]:
+def _run(upstream_sequence: list) -> tuple[httpx.Response, list[dict], list]:
     """Post one chat turn, serving `upstream_sequence` to successive calls.
+
+    Each entry is either a payload dict (served as `200`) or an explicit
+    `(status, payload)` pair — non-2xx continuations are the whole point of the
+    status-handling tests, and `_retry_request` hands those back without
+    raising.
 
     Returns the response, the request bodies that went upstream, and the
     RequestOutcome objects the proxy recorded.
@@ -124,10 +129,16 @@ def _run(upstream_sequence: list[dict]) -> tuple[httpx.Response, list[dict], lis
     outcomes: list = []
     remaining = list(upstream_sequence)
 
+    def _next() -> tuple[int, dict]:
+        entry = remaining.pop(0) if remaining else upstream_sequence[-1]
+        if isinstance(entry, tuple):
+            return entry
+        return 200, entry
+
     async def fake_retry(method, url, headers, req_body, *args, **kwargs):
         sent.append(req_body)
-        payload = remaining.pop(0) if remaining else upstream_sequence[-1]
-        return httpx.Response(200, json=payload, headers={"content-type": "application/json"})
+        status, payload = _next()
+        return httpx.Response(status, json=payload, headers={"content-type": "application/json"})
 
     app = create_app(_config())
     with TestClient(app) as client:
@@ -142,9 +153,9 @@ def _run(upstream_sequence: list[dict]) -> tuple[httpx.Response, list[dict], lis
                 import json as _json
 
                 sent.append(_json.loads(content) if content else {})
-                payload = remaining.pop(0) if remaining else upstream_sequence[-1]
+                status, payload = _next()
                 return httpx.Response(
-                    200, json=payload, headers={"content-type": "application/json"}
+                    status, json=payload, headers={"content-type": "application/json"}
                 )
 
         proxy.http_client = _FakeHTTPClient()
@@ -218,6 +229,85 @@ def test_the_forwarded_body_keeps_the_provider_usage_untouched():
     hash_key = _stored_hash()
     resp, _sent, _outcomes = _run([_retrieve_call_response(hash_key), _final_response()])
     assert (resp.json().get("usage") or {}).get("prompt_tokens") == 400
+
+
+ERROR_BODY = {"error": {"message": "invalid api key", "type": "invalid_request_error"}}
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        401,  # any 4xx: `_retry_request` returns it without raising
+        429,  # retries exhausted, returned verbatim
+        500,  # retries exhausted, returned via the HTTPStatusError branch
+    ],
+)
+def test_a_non_2xx_continuation_never_reaches_the_client_as_200(status):
+    """An upstream error must not be served under the first call's `200`.
+
+    `_retry_request` deliberately does not raise for anything it will not retry,
+    so a continuation failure looks exactly like a success unless the status is
+    checked. Parsing that body and returning it as the model's answer produced
+    an HTTP 200 whose payload was an error object with no `choices` at all — a
+    shape no client expects, and one that hides an auth or quota failure.
+    """
+    hash_key = _stored_hash()
+    resp, sent, _outcomes = _run([_retrieve_call_response(hash_key), (status, ERROR_BODY)])
+
+    assert len(sent) == 2, "the continuation should still have been attempted"
+    body = resp.json()
+    assert "error" not in body, (
+        f"a {status} continuation body was forwarded as the model's reply "
+        f"under HTTP {resp.status_code}"
+    )
+    assert body.get("choices"), "the forwarded body lost its choices"
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_a_failed_continuation_forwards_the_original_reply_unchanged(status):
+    """Fail open, and byte-for-byte.
+
+    `handle_response` swallows a continuation failure and returns the response
+    it already had, which is the same contract a transport error or timeout on
+    that call already gets. The client therefore sees the model's original
+    reply — including the unresolved tool call it cannot run, which is strictly
+    better than an error object dressed as a completion, and is the documented
+    behaviour for every other way a continuation can fail.
+
+    Byte fidelity matters here too: nothing was resolved, so the upstream bytes
+    must be forwarded as they arrived rather than re-serialized from a parsed
+    dict.
+    """
+    hash_key = _stored_hash()
+    original = _retrieve_call_response(hash_key)
+    resp, _sent, _outcomes = _run([original, (status, ERROR_BODY)])
+
+    assert resp.status_code == 200
+    assert resp.json() == original, "the original upstream reply was not forwarded unchanged"
+    assert resp.content == httpx.Response(200, json=original).content, (
+        "the body was re-serialized instead of forwarded verbatim"
+    )
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_a_failed_continuation_is_not_billed(status):
+    """A non-2xx continuation returns no usage, so it must not be counted.
+
+    Only the first call was billed. Recording the error response — or settling
+    against the wrong object — would inflate the turn with tokens that were
+    never charged, which is the same class of bug in the opposite direction as
+    the dropped first call.
+    """
+    hash_key = _stored_hash()
+    _resp, sent, outcomes = _run([_retrieve_call_response(hash_key), (status, ERROR_BODY)])
+
+    assert len(sent) == 2
+    assert outcomes, "no RequestOutcome was recorded"
+    recorded = outcomes[-1].provider_input_tokens
+    assert recorded == 100, (
+        f"cost tracking saw {recorded} input tokens; only the first call "
+        "(100) was billed, the continuation returned an error with no usage"
+    )
 
 
 def test_headroom_accounting_counts_both_upstream_calls():

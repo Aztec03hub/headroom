@@ -288,6 +288,28 @@ RESPONSES_USAGE_KEYS = {
 }
 
 
+class CCRContinuationHTTPError(Exception):
+    """A CCR continuation call came back non-2xx.
+
+    ``_retry_request`` deliberately returns rather than raises for the statuses
+    it will not retry — any 4xx, an exhausted 429/529, an exhausted 5xx — so a
+    continuation failure is indistinguishable from success unless the status is
+    checked. Parsing such a body and returning it as the model's answer would
+    serialize an upstream *error* under the original call's ``200``.
+
+    Raising instead routes the turn into
+    ``CCRResponseHandler.handle_response``'s existing continuation-failure
+    path, which forwards the response it already had. That keeps one behaviour
+    for every way a continuation can fail: transport error, timeout, and now
+    an error status.
+    """
+
+    def __init__(self, status_code: int, body_preview: str) -> None:
+        super().__init__(f"CCR continuation returned HTTP {status_code}: {body_preview}")
+        self.status_code = status_code
+        self.body_preview = body_preview
+
+
 class TurnHookUsage:
     """Upstream calls a turn hook caused that nothing else will account for.
 
@@ -5271,6 +5293,7 @@ class OpenAIHandlerMixin:
                 # let retrieval hide its own cost, which is the mistake the
                 # matching comment on the re-drive block below warns about.
                 _ccr_final_json: dict[str, Any] | None = None
+                _ccr_cont_error: tuple[int, str] | None = None
                 if self.ccr_response_handler is not None and response.status_code == 200:
                     try:
                         _pre_ccr_json = response.json()
@@ -5307,9 +5330,19 @@ class OpenAIHandlerMixin:
                             }
                             continuation_headers["content-type"] = "application/json"
                             continuation_headers["accept"] = "application/json"
+                            nonlocal _ccr_cont_error
                             cont = await self._retry_request(
                                 "POST", url, continuation_headers, continuation_body
                             )
+                            # `_retry_request` returns non-2xx verbatim for
+                            # everything it will not retry, so the status has to
+                            # be checked before the body is treated as an answer.
+                            # Without this an upstream 401, or an exhausted 429,
+                            # reaches the client as HTTP 200 carrying an error
+                            # object.
+                            if not 200 <= cont.status_code < 300:
+                                _ccr_cont_error = (cont.status_code, cont.text[:200])
+                                raise CCRContinuationHTTPError(*_ccr_cont_error)
                             cont_json: dict[str, Any] = cont.json()
                             _hook_usage.record(cont_json, **CHAT_USAGE_KEYS)
                             return cont_json
@@ -5323,7 +5356,32 @@ class OpenAIHandlerMixin:
                                 _ccr_api_call_fn,
                                 provider="openai",
                             )
-                            _hook_usage.settle(_ccr_final_json)
+                            # `handle_response` swallows a continuation failure
+                            # and hands back the response it already had, so a
+                            # failed turn is only detectable here. Identity —
+                            # not equality — is the signal that nothing was
+                            # resolved, and it also covers max-rounds
+                            # exhaustion. Dropping back to `None` makes the
+                            # return below forward the upstream bytes verbatim
+                            # instead of re-serializing a dict that came from
+                            # them, which is what byte-faithful forwarding
+                            # means on a path that changed nothing.
+                            if _ccr_cont_error is not None or _ccr_final_json is _pre_ccr_json:
+                                if _ccr_cont_error is not None:
+                                    logger.warning(
+                                        f"[{request_id}] CCR: continuation returned HTTP "
+                                        f"{_ccr_cont_error[0]}; forwarding the upstream reply "
+                                        f"unchanged (body: {_ccr_cont_error[1]!r})"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[{request_id}] CCR: retrieval did not resolve; "
+                                        "forwarding the upstream reply unchanged"
+                                    )
+                                _ccr_final_json = None
+                                _hook_usage.settle(_pre_ccr_json)
+                            else:
+                                _hook_usage.settle(_ccr_final_json)
                         except Exception as ccr_err:
                             # Fail open to the model's own reply rather than 502 a
                             # turn the client could still act on.
