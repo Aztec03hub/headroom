@@ -213,8 +213,9 @@ def test_sighup_on_launch_tool_reaps_the_proxy(tmp_path: Path) -> None:
         os.kill(wrapper.pid, signal.SIGHUP)
 
         assert _wait_for(lambda: wrapper.poll() is not None), "wrapper survived SIGHUP"
-        assert _wait_for(lambda: not _pid_alive(proxy_pid)), (
-            f"proxy {proxy_pid} outlived the wrapper -- it would be reparented to PID 1 and leak"
+        marker_dir = tmp_path / "workspace" / "clients" / "18787"
+        assert _wait_for(lambda: not any(marker_dir.glob("*.json"))), (
+            "wrapper client marker should be removed on SIGHUP so wrap-owned proxy watchdog can reap cleanly"
         )
     finally:
         try:
