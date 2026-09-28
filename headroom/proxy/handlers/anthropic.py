@@ -5100,6 +5100,13 @@ class AnthropicHandlerMixin:
                 # Log full error details internally for debugging
                 logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
 
+                # An untrusted TLS-inspection root is the one failure worth
+                # spelling out: it is environmental, never transient, and the
+                # message names only the certificate issuer and the fix.
+                from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+                tls_hint = await describe_upstream_failure_async(e, self.ANTHROPIC_API_URL)
+
                 # Return sanitized error message to client (don't expose internal details)
                 return JSONResponse(
                     status_code=502,
@@ -5107,7 +5114,8 @@ class AnthropicHandlerMixin:
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": "An error occurred while processing your request. Please try again.",
+                            "message": tls_hint
+                            or "An error occurred while processing your request. Please try again.",
                         },
                     },
                 )
