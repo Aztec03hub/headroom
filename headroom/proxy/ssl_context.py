@@ -339,8 +339,8 @@ def _default_strict_relaxed_context() -> ssl.SSLContext:
     return _clear_x509_strict(ctx, reason="env_toggle")
 
 
-def build_httpx_verify() -> ssl.SSLContext | bool:
-    """Return the value for httpx's ``verify=`` parameter.
+def _configured_context(alpn: list[str]) -> ssl.SSLContext | None:
+    """The context Headroom's trust configuration calls for, or None for "library default".
 
     Resolution order:
 
@@ -348,46 +348,61 @@ def build_httpx_verify() -> ssl.SSLContext | bool:
        ``HEADROOM_CERT_STORE`` includes ``system`` — the default — and no
        replacement bundle var is set.
     1. A custom CA bundle env var (``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` /
-       ``NODE_EXTRA_CA_CERTS``) → a context trusting that bundle, with strict
-       mode already relaxed (corporate PKI signal).
+       ``NODE_EXTRA_CA_CERTS`` / ``HEADROOM_CA_BUNDLE``) → a context trusting
+       that bundle, with strict mode already relaxed (corporate PKI signal).
     2. No bundle, but ``HEADROOM_TLS_STRICT=0`` → the default trust store with
        ``VERIFY_X509_STRICT`` cleared, so a corporate root that's installed in
        the OS store but trips RFC 5280 strict mode still validates.
-    3. Otherwise → ``True`` (httpx's default strict verification).
-
-    Returning ``True`` rather than a hand-built context in the common case
-    keeps httpx's own default behavior (including its certifi fallback) intact.
     """
-    system_ctx = _system_trust_context(["h2", "http/1.1"])
+    system_ctx = _system_trust_context(alpn)
     if system_ctx is not None:
         return system_ctx
-    ca_ctx = find_ca_bundle()
-    if ca_ctx is not None:
-        return ca_ctx
-    if tls_strict_disabled():
-        return _default_strict_relaxed_context()
-    return True
+    ctx = find_ca_bundle()
+    if ctx is None and tls_strict_disabled():
+        ctx = _default_strict_relaxed_context()
+    if ctx is not None:
+        ctx.set_alpn_protocols(alpn)
+    return ctx
+
+
+def _bundled_default_context() -> ssl.SSLContext:
+    """Exactly what httpx builds for ``verify=True``: certifi, strict defaults.
+
+    Built here rather than passing ``True`` so every upstream client receives a
+    concrete, always-verifying ``SSLContext``: no code path can hand httpx a
+    boolean that could ever be ``False``.
+    """
+    cert_dir = os.environ.get("SSL_CERT_DIR")
+    if cert_dir:
+        ctx = ssl.create_default_context(capath=cert_dir)
+    else:
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    return ctx
+
+
+def build_httpx_verify() -> ssl.SSLContext:
+    """Return the value for httpx's ``verify=`` parameter: always a verifying context.
+
+    Headroom's configured trust (see :func:`_configured_context`) when there is
+    one, else httpx's own default (certifi) built explicitly.
+    """
+    return _configured_context(["h2", "http/1.1"]) or _bundled_default_context()
 
 
 def build_urlopen_context() -> ssl.SSLContext | None:
     """Return Headroom's configured TLS context for ``urllib.request.urlopen``.
 
-    ``urlopen`` already handles Python's default trust configuration when no
-    explicit context is passed. Return only a custom context here so callers
-    retain that default while sharing Headroom's corporate CA and strict-mode
-    handling when it is configured.
+    ``None`` means "use urlopen's own default" (Python's default trust store),
+    which is what the legacy ``HEADROOM_CERT_STORE=bundled`` path wants when no
+    bundle or strict-mode toggle is configured. urllib.request/http.client only
+    implements HTTP/1.1 framing, so the context only offers ``http/1.1``:
+    offering h2 can make a TLS-inspecting MITM negotiate a protocol it cannot
+    parse.
     """
-
-    system_ctx = _system_trust_context(["http/1.1"])
-    if system_ctx is not None:
-        return system_ctx
-    verify = build_httpx_verify()
-    if not isinstance(verify, ssl.SSLContext):
-        return None
-    # urllib.request/http.client only implements HTTP/1.1 framing. Offering h2
-    # can make a TLS-inspecting MITM negotiate a protocol it cannot parse.
-    verify.set_alpn_protocols(["http/1.1"])
-    return verify
+    return _configured_context(["http/1.1"])
 
 
 def apply_global_tls_relaxation() -> bool:
@@ -443,18 +458,18 @@ def apply_global_tls_relaxation() -> bool:
     return True
 
 
-def build_websocket_ssl() -> ssl.SSLContext | bool:
+def build_websocket_ssl() -> ssl.SSLContext:
     """Return the value for ``websockets.connect(ssl=...)`` on a ``wss://`` URL.
 
     WebSocket upgrades are HTTP/1.1, so the context only offers ``http/1.1``.
-    Falls back to ``True`` (the websockets default, which on Windows loads the
-    machine store) when neither the OS store nor a custom bundle applies.
+    Without configured trust it is what ``ssl=True`` would build (the stdlib
+    default, which on Windows loads the machine store).
     """
-    system_ctx = _system_trust_context(["http/1.1"])
-    if system_ctx is not None:
-        return system_ctx
-    ctx = build_urlopen_context()
-    return ctx if ctx is not None else True
+    ctx = _configured_context(["http/1.1"])
+    if ctx is None:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["http/1.1"])
+    return ctx
 
 
 def ensure_process_trust() -> bool:

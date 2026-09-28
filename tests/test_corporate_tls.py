@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import http.server
 import json
+import re
 import ssl
 import threading
 from collections.abc import Iterator
@@ -151,6 +152,7 @@ def fake_zscaler(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str,
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     server_ctx.load_cert_chain(str(leaf_pem))
     server.socket = server_ctx.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -178,9 +180,12 @@ class TestTrustPolicy:
 
     def test_bundled_restores_legacy_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_CERT_STORE", "bundled")
-        assert build_httpx_verify() is True
+        truststore = pytest.importorskip("truststore")
+        for ctx in (build_httpx_verify(), build_websocket_ssl()):
+            assert isinstance(ctx, ssl.SSLContext)
+            assert not isinstance(ctx, truststore.SSLContext)
+            assert ctx.verify_mode == ssl.CERT_REQUIRED
         assert build_urlopen_context() is None
-        assert build_websocket_ssl() is True
 
     def test_unknown_tokens_fall_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_CERT_STORE", "keychain")
@@ -410,7 +415,7 @@ class TestStreamingErrorSurface:
         assert result.status_code == 502
         assert "Zscaler is inspecting this connection" in body
         assert "HEADROOM_CA_BUNDLE" in body
-        assert "api.anthropic.com" in body
+        assert re.search(r"certificate for api\.anthropic\.com \(", body)
 
 
 class TestReviewFixes:

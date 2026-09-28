@@ -302,7 +302,12 @@ def probe_presented_chain(
 def _probe_uncached(host: str, port: int, *, timeout: float, allow_private: bool) -> ChainInfo:
     proxy = _proxy_for(host)
     info = ChainInfo(host=host, port=port, reachable=False, via_proxy=proxy)
+    # Certificate-inspection handshake only: it reads the presented chain and
+    # closes without sending a byte, so it deliberately skips verification (the
+    # chain is what we are diagnosing). It still refuses TLS < 1.2, and it only
+    # connects through the public-address / env-proxy CONNECT guard below.
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
