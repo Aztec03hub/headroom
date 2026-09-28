@@ -2954,12 +2954,41 @@ async def _read_request_body_bytes(request: Request) -> bytes:
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure, and the
-    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
-    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    Raises the :class:`RequestBodyTooLarge` ``ValueError`` subclass if the
+    wire-size body itself exceeds :data:`MAX_REQUEST_BODY_SIZE` (checked while
+    streaming, before the full body is buffered) or if the *decompressed*
+    body would exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`. Raises plain
+    ``ValueError`` on any other decompression failure.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
-    raw = await request.body()
+
+    # Content-Length is an optimization only, not the enforcement boundary: it
+    # can be absent, understated, or belong to a chunked transfer. The
+    # streaming loop below is what actually bounds every case (#3479).
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB "
+                f"(Content-Length: {declared})"
+            )
+
+    chunks = bytearray()
+    async for chunk in request.stream():
+        chunks.extend(chunk)
+        if len(chunks) > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+            )
+    raw: bytes = bytes(chunks)
+    # Cache like Starlette's own body() would, so any other .body() caller on
+    # this request (there is none today, but future callers get the same
+    # semantics) sees the bytes already read rather than a consumed stream.
+    request._body = raw
 
     # Every branch below decompresses incrementally against
     # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
@@ -3917,6 +3946,11 @@ def inject_tool_search_deferral(
 # ---------------------------------------------------------------------------
 
 _TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+# A client-side tool-search result (a plain ``tool_result`` carrying
+# ``tool_reference`` blocks) that is left with no resolvable references keeps
+# this text as its content, so its paired ``tool_use`` stays valid -- dropping
+# the block outright would orphan the tool_use (which 400s on its own).
+_CLIENT_TOOL_REF_PLACEHOLDER = "[tool reference no longer available]"
 
 
 def _tool_search_reference_names(content: Any) -> list[str]:
@@ -3951,10 +3985,12 @@ _TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
     """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
-    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
-    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
-    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are handled (an orphan of either 400s on its own).
+    Server-side search block pairs require a matching search mechanism and
+    referenced tools in the outbound tools array. Unsupported pairs are
+    replaced in place. Client-side ``tool_result`` references need only their
+    target definitions: missing references are removed from the nested result,
+    with ``_CLIENT_TOOL_REF_PLACEHOLDER`` retaining an otherwise empty result
+    so its paired ``tool_use`` is not orphaned.
 
     Replace in place rather than remove (#3456). The block indexes of a message
     are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
@@ -4004,8 +4040,41 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 
         neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
+        rewrites: dict[int, Any] = {}
         for index, block in enumerate(content):
-            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            # Client-side shape: a plain tool_result carrying tool_reference
+            # blocks. Keep resolvable references (deferred-but-present included);
+            # drop the unsupportable ones. If none survive, swap the content for
+            # a placeholder so the paired tool_use is not orphaned.
+            if block_type == "tool_result" and isinstance(block.get("content"), list):
+                inner = block["content"]
+                if any(isinstance(b, dict) and b.get("type") == "tool_reference" for b in inner):
+                    kept_inner: list[Any] = []
+                    dropped = 0
+                    for b in inner:
+                        if isinstance(b, dict) and b.get("type") == "tool_reference":
+                            # Validated against the available definitions ONLY.
+                            # A built-in tool_search_tool_* is deliberately not
+                            # required: Anthropic supports a custom client-side
+                            # search that returns tool_reference blocks from a
+                            # plain tool_use/tool_result pair, referencing the
+                            # top-level tools array. Gating on the server tool
+                            # deleted those valid references.
+                            name = b.get("tool_name") or b.get("name")
+                            if name is not None and str(name) not in available:
+                                dropped += 1
+                                continue
+                        kept_inner.append(b)
+                    if dropped:
+                        new_block = dict(block)
+                        new_block["content"] = kept_inner or _CLIENT_TOOL_REF_PLACEHOLDER
+                        rewrites[index] = new_block
+                        removed += dropped
+                continue
+            if block_type != _TOOL_SEARCH_RESULT_TYPE:
                 continue
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
@@ -4024,7 +4093,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
                 neutralize_indexes.add(index)
 
-        if not neutralize_indexes:
+        if not neutralize_indexes and not rewrites:
             out.append(message)
             continue
 
@@ -4032,7 +4101,9 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
         removed += len(neutralize_indexes)
         repaired = dict(message)
         repaired["content"] = [
-            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK)
+            if index in neutralize_indexes
+            else rewrites.get(index, block)
             for index, block in enumerate(content)
         ]
         out.append(repaired)
