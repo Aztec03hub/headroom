@@ -53,12 +53,27 @@ CERT_STORE_ENV = "HEADROOM_CERT_STORE"
 EXTRA_CA_ENV = "HEADROOM_CA_BUNDLE"
 
 _CERT_STORE_SOURCES = frozenset({"system", "bundled"})
+# Spellings people reach for; a typo'd opt-out must not silently re-enable a source.
+_CERT_STORE_ALIASES = {
+    "bundle": "bundled",
+    "certifi": "bundled",
+    "os": "system",
+    "native": "system",
+}
 _DEFAULT_CERT_STORE = frozenset({"system", "bundled"})
 
 # Additive bundles, loaded on top of whatever trust store is in force.
 _ADDITIVE_CA_VARS = (EXTRA_CA_ENV, "NODE_EXTRA_CA_CERTS")
 
+# Set by Headroom's CLI (and inherited by the proxy processes it spawns) so
+# proxy startup only injects process-wide when Headroom owns the process.
+PROCESS_TRUST_ENV = "HEADROOM_PROCESS_TRUST"
+
 _process_trust_injected = False
+
+# Built contexts, keyed by ALPN + every env var that shapes them. Building one
+# parses certifi's ~140 roots, so it must not run per WebSocket connection.
+_system_ctx_cache: dict[tuple[Any, ...], ssl.SSLContext] = {}
 
 _REPLACEMENT_CA_VARS = (
     "SSL_CERT_FILE",
@@ -206,7 +221,11 @@ def cert_store_sources() -> frozenset[str]:
     raw = os.environ.get(CERT_STORE_ENV)
     if raw is None or not raw.strip():
         return _DEFAULT_CERT_STORE
-    tokens = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    tokens = {
+        _CERT_STORE_ALIASES.get(t.strip().lower(), t.strip().lower())
+        for t in raw.split(",")
+        if t.strip()
+    }
     unknown = tokens - _CERT_STORE_SOURCES
     if unknown:
         logger.warning(
@@ -245,10 +264,24 @@ def _system_trust_context(alpn: list[str]) -> ssl.SSLContext | None:
     """
     if not _system_store_enabled():
         return None
+    key = (
+        tuple(alpn),
+        os.environ.get(CERT_STORE_ENV),
+        *(os.environ.get(var) for var in _ADDITIVE_CA_VARS),
+    )
+    cached = _system_ctx_cache.get(key)
+    if cached is not None:
+        return cached
     try:
         import truststore
 
         ctx: ssl.SSLContext = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Match create_default_context() on 3.13+: an explicitly trusted
+        # intermediate (a common "Zscaler Intermediate Root CA" export) is a
+        # valid anchor. Only affects the OpenSSL (Linux) backend.
+        partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        if partial_chain:
+            ctx.verify_flags |= partial_chain
         if "bundled" in cert_store_sources():
             try:
                 import certifi
@@ -264,6 +297,7 @@ def _system_trust_context(alpn: list[str]) -> ssl.SSLContext | None:
         # bundled behavior and say so.
         logger.warning("event=ssl_system_store_failed error=%r (falling back to bundled)", exc)
         return None
+    _system_ctx_cache[key] = ctx
     return ctx
 
 
@@ -426,6 +460,9 @@ def build_websocket_ssl() -> ssl.SSLContext | bool:
 def ensure_process_trust() -> bool:
     """Make every TLS client in this *application* process use the OS store.
 
+    Marks the process (``HEADROOM_PROCESS_TRUST=1``) so proxy processes the CLI
+    spawns inherit the decision; see :func:`ensure_process_trust_if_owned`.
+
     Headroom's own upstream clients get an explicit context from the builders
     above, but third-party code (``huggingface_hub`` model downloads, tiktoken
     vocab fetches, OTEL exporters, ...) builds its own. ``truststore``'s
@@ -439,6 +476,7 @@ def ensure_process_trust() -> bool:
     Idempotent. Returns True when injection is in place.
     """
     global _process_trust_injected
+    os.environ[PROCESS_TRUST_ENV] = "1"
     if _process_trust_injected:
         return True
     if not _system_store_enabled():
@@ -453,3 +491,16 @@ def ensure_process_trust() -> bool:
     _process_trust_injected = True
     logger.info("event=ssl_process_trust_injected source=os_trust_store")
     return True
+
+
+def ensure_process_trust_if_owned() -> bool:
+    """:func:`ensure_process_trust`, but only in a process Headroom's CLI owns.
+
+    Proxy startup calls this: uvicorn workers spawned by ``headroom proxy``
+    inherit ``HEADROOM_PROCESS_TRUST=1`` and get injection, while an application
+    that embeds the proxy app keeps its own process-wide TLS behavior (its
+    Headroom upstream clients still get the OS store via explicit contexts).
+    """
+    if os.environ.get(PROCESS_TRUST_ENV) != "1":
+        return False
+    return ensure_process_trust()

@@ -411,3 +411,98 @@ class TestStreamingErrorSurface:
         assert "Zscaler is inspecting this connection" in body
         assert "HEADROOM_CA_BUNDLE" in body
         assert "api.anthropic.com" in body
+
+
+class TestReviewFixes:
+    def test_opt_out_aliases_are_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HEADROOM_CERT_STORE", "bundle")
+        assert cert_store_sources() == {"bundled"}
+        monkeypatch.setenv("HEADROOM_CERT_STORE", "os")
+        assert cert_store_sources() == {"system"}
+
+    def test_system_context_is_built_once_per_config(
+        self, monkeypatch: pytest.MonkeyPatch, fake_zscaler: dict
+    ) -> None:
+        pytest.importorskip("truststore")
+        ssl_context._system_ctx_cache.clear()
+        first = build_websocket_ssl()
+        assert build_websocket_ssl() is first
+        monkeypatch.setenv("HEADROOM_CA_BUNDLE", fake_zscaler["root"])
+        assert build_websocket_ssl() is not first
+
+    def test_partial_chain_is_enabled(self) -> None:
+        pytest.importorskip("truststore")
+        flag = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        if not flag:
+            pytest.skip("OpenSSL build without partial-chain support")
+        ctx = build_httpx_verify()
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.verify_flags & flag
+
+    def test_proxy_startup_only_injects_in_cli_owned_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        truststore = pytest.importorskip("truststore")
+        calls: list[int] = []
+        monkeypatch.setattr(truststore, "inject_into_ssl", lambda: calls.append(1))
+        monkeypatch.setattr(ssl_context, "_process_trust_injected", False)
+        monkeypatch.delenv(ssl_context.PROCESS_TRUST_ENV, raising=False)
+        assert ssl_context.ensure_process_trust_if_owned() is False
+        assert calls == []
+        monkeypatch.setenv(ssl_context.PROCESS_TRUST_ENV, "1")
+        assert ssl_context.ensure_process_trust_if_owned() is True
+        assert calls == [1]
+
+    def test_concurrent_probes_share_one_handshake(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
+        calls: list[str] = []
+
+        def slow_probe(host: str, port: int, **_: object) -> tls_diagnostics.ChainInfo:
+            calls.append(host)
+            _time.sleep(0.2)
+            return tls_diagnostics.ChainInfo(host=host, port=port, reachable=True)
+
+        monkeypatch.setattr(tls_diagnostics, "_probe_uncached", slow_probe)
+        with ThreadPoolExecutor(8) as pool:
+            list(
+                pool.map(
+                    lambda _: tls_diagnostics.probe_presented_chain("api.example.com"), range(8)
+                )
+            )
+        assert calls == ["api.example.com"]
+
+    def test_private_allowed_probe_is_not_served_to_request_path(self, fake_zscaler: dict) -> None:
+        port = fake_zscaler["port"]
+        allowed = tls_diagnostics.probe_presented_chain("127.0.0.1", port, allow_private=True)
+        assert allowed.issuer
+        guarded = tls_diagnostics.probe_presented_chain("127.0.0.1", port)
+        assert guarded.issuer is None
+
+    def test_probe_ignores_os_proxy_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import urllib.request
+
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"https": "http://os-proxy:3128"})
+        assert tls_diagnostics._proxy_for("api.anthropic.com") is None
+        monkeypatch.setenv("HTTPS_PROXY", "http://env-proxy:8080")
+        assert tls_diagnostics._proxy_for("api.anthropic.com") == "http://env-proxy:8080"
+
+    def test_wrap_notice_goes_to_stderr(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`wrap <tool> --prepare-only` stdout is machine-read JSON; keep it clean."""
+        import click
+
+        from headroom.cli import wrap as wrap_mod
+
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+        # Registered so monkeypatch restores them: the callback writes os.environ.
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        monkeypatch.setattr(wrap_mod, "_should_purge_context_tools", lambda ctx: False)
+        with click.Context(wrap_mod.wrap) as ctx:
+            ctx.invoke(wrap_mod.wrap.callback)
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "NO_PROXY" in err

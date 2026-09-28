@@ -5105,7 +5105,13 @@ class AnthropicHandlerMixin:
                 # message names only the certificate issuer and the fix.
                 from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
 
-                tls_hint = await describe_upstream_failure_async(e, self.ANTHROPIC_API_URL)
+                # Probe the host that actually failed: `url` is the per-request
+                # upstream (Copilot, a custom gateway) once it has been built;
+                # an exception raised before that point never reached a host.
+                _failed_url = locals().get("url")
+                tls_hint = await describe_upstream_failure_async(
+                    e, _failed_url if isinstance(_failed_url, str) else self.ANTHROPIC_API_URL
+                )
 
                 # Return sanitized error message to client (don't expose internal details)
                 return JSONResponse(

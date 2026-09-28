@@ -1963,6 +1963,9 @@ dependencies = [
  "prometheus",
  "proptest",
  "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
@@ -1977,6 +1980,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
  "wiremock",
 ]
 

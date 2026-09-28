@@ -5085,9 +5085,11 @@ def wrap(ctx: click.Context) -> None:
     # and probes the proxy over loopback itself, so one fix here covers all.
     added = _ensure_loopback_no_proxy(os.environ)
     if added:
+        # stderr: `wrap <tool> --prepare-only` prints machine-read JSON on stdout.
         click.echo(
             f"  Added 127.0.0.1,localhost,::1 to {'/'.join(added)} so the agent reaches "
-            "Headroom directly instead of through your HTTP proxy."
+            "Headroom directly instead of through your HTTP proxy.",
+            err=True,
         )
 
 

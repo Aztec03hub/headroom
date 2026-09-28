@@ -72,8 +72,11 @@ _ENCODING_DER = getattr(ssl._ssl, "ENCODING_DER", 1)  # type: ignore[attr-define
 
 _PROBE_TIMEOUT_S = 4.0
 _PROBE_CACHE_TTL_S = 300.0
-_probe_cache: dict[tuple[str, int], tuple[float, ChainInfo]] = {}
+_probe_cache: dict[tuple[str, int, bool], tuple[float, ChainInfo]] = {}
 _probe_lock = threading.Lock()
+# One in-flight probe per (host, port): a burst of failing requests waits for
+# the first handshake instead of each opening its own.
+_probe_inflight: dict[tuple[str, int, bool], threading.Lock] = {}
 _logged_hosts: set[str] = set()
 
 
@@ -202,14 +205,19 @@ def _decode_der(der: bytes) -> dict[str, Any]:
 
 
 def _proxy_for(host: str) -> str | None:
-    """The explicit HTTPS proxy the OS/env would use for ``host``, if any."""
+    """The HTTPS proxy the upstream client would use for ``host``, if any.
+
+    Environment only, like httpx's ``trust_env``: the OS proxy settings that
+    ``urllib.request.getproxies`` also reads on macOS/Windows are not what the
+    proxy's requests use, so probing through them would diagnose another path.
+    """
     try:
-        if urllib.request.proxy_bypass(host):
+        if urllib.request.proxy_bypass_environment(host):  # type: ignore[attr-defined]
             return None
-        proxy = urllib.request.getproxies().get("https")
+        env = urllib.request.getproxies_environment()
     except Exception:
         return None
-    return proxy or None
+    return env.get("https") or env.get("all") or None
 
 
 def _open_tunnel(host: str, port: int, proxy_url: str, timeout: float) -> socket.socket:
@@ -245,12 +253,10 @@ def _public_address(host: str, port: int, timeout: float) -> tuple[str, int] | N
     """
     import ipaddress
 
-    prev = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    finally:
-        socket.setdefaulttimeout(prev)
+    # No timeout knob exists for getaddrinfo; the caller already runs off the
+    # event loop, and the process-wide socket default must not be touched here.
+    del timeout
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         if not ip.is_global:
@@ -275,14 +281,25 @@ def probe_presented_chain(
     are skipped unless ``allow_private`` (``doctor``, which the user runs on
     purpose, sets it).
     """
-    key = (host, port)
-    now = time.monotonic()
-    if use_cache:
+    # allow_private is part of the key so a doctor/test probe of a private host
+    # can never be served to the request path.
+    key = (host, port, allow_private)
+    if not use_cache:
+        return _probe_uncached(host, port, timeout=timeout, allow_private=allow_private)
+    with _probe_lock:
+        gate = _probe_inflight.setdefault(key, threading.Lock())
+    with gate:
         with _probe_lock:
             cached = _probe_cache.get(key)
-        if cached and now - cached[0] < _PROBE_CACHE_TTL_S:
+        if cached and time.monotonic() - cached[0] < _PROBE_CACHE_TTL_S:
             return cached[1]
+        info = _probe_uncached(host, port, timeout=timeout, allow_private=allow_private)
+        with _probe_lock:
+            _probe_cache[key] = (time.monotonic(), info)
+        return info
 
+
+def _probe_uncached(host: str, port: int, *, timeout: float, allow_private: bool) -> ChainInfo:
     proxy = _proxy_for(host)
     info = ChainInfo(host=host, port=port, reachable=False, via_proxy=proxy)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -320,9 +337,6 @@ def probe_presented_chain(
         info.inspection_vendor = identify_inspection_vendor(info.issuer, *info.chain_issuers)
     except Exception as exc:
         info.error = f"{type(exc).__name__}: {exc}"
-
-    with _probe_lock:
-        _probe_cache[key] = (now, info)
     return info
 
 

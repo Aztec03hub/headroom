@@ -33,6 +33,8 @@ def _undo_process_trust_injection():
         from headroom.proxy import ssl_context
     except Exception:
         return
+    os.environ.pop(ssl_context.PROCESS_TRUST_ENV, None)
+    ssl_context._system_ctx_cache.clear()
     if ssl_context._process_trust_injected:
         import truststore
 

@@ -962,7 +962,13 @@ def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, .
     ]
     from headroom.proxy.ssl_context import describe_trust_policy
 
-    checks.append(check_trust_policy(describe_trust_policy()))
+    # Prefer the running proxy's own policy (its env can differ from this
+    # shell's under launchd/systemd); fall back to what this shell would use.
+    proxy_tls = ((health or {}).get("config") or {}).get("tls")
+    trust_row = check_trust_policy(proxy_tls or describe_trust_policy())
+    if not proxy_tls:
+        trust_row.summary += " (this shell; proxy not reporting)"
+    checks.append(trust_row)
     proxy_env_check = check_proxy_env(os.environ)
     if proxy_env_check is not None:
         checks.append(proxy_env_check)
