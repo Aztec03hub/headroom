@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+from collections.abc import Callable
 from typing import Any, cast
 
 logger = logging.getLogger("headroom.proxy")
@@ -127,16 +128,22 @@ def _relax_x509_strict_for_custom_ca(ctx: ssl.SSLContext, *, path: str) -> ssl.S
     return _clear_x509_strict(ctx, reason=f"custom_ca:{path}")
 
 
+def _require_tls12(ctx: ssl.SSLContext) -> ssl.SSLContext:
+    """Refuse TLS < 1.2 explicitly (Python's default, stated so it cannot regress)."""
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
 def _replacement_ca_context(path: str) -> ssl.SSLContext:
     """Build a replacement trust-store context from a CA bundle path."""
-    ctx = ssl.create_default_context(cafile=path)
+    ctx = _require_tls12(ssl.create_default_context(cafile=path))
     ctx.set_alpn_protocols(["h2", "http/1.1"])
     return _relax_x509_strict_for_custom_ca(ctx, path=path)
 
 
 def _additive_ca_context(path: str) -> ssl.SSLContext:
     """Build an additive trust-store context from a CA bundle path."""
-    ctx = ssl.create_default_context()
+    ctx = _require_tls12(ssl.create_default_context())
     ctx.load_verify_locations(cafile=path)
     ctx.set_alpn_protocols(["h2", "http/1.1"])
     return _relax_x509_strict_for_custom_ca(ctx, path=path)
@@ -182,12 +189,16 @@ def find_ca_bundle() -> ssl.SSLContext | None:
     return None
 
 
-def _additive_ca_paths() -> list[str]:
-    """Existing files named by the additive CA vars, logging each one once seen."""
+def _additive_ca_paths(*, log: bool = True) -> list[str]:
+    """Existing files named by the additive CA vars (logged unless ``log=False``)."""
     paths: list[str] = []
     for var in _ADDITIVE_CA_VARS:
         path = os.environ.get(var)
         if not path:
+            continue
+        if not log:
+            if os.path.isfile(path):
+                paths.append(path)
             continue
         if os.path.isfile(path):
             logger.info(
@@ -254,16 +265,15 @@ def _system_store_enabled() -> bool:
     )
 
 
-def _system_trust_context(alpn: list[str]) -> ssl.SSLContext | None:
-    """A context that verifies through the OS trust store, or None if unavailable.
+def _build_system_context(alpn: list[str]) -> ssl.SSLContext:
+    """A context that verifies through the OS trust store. Raises if it cannot.
 
     ``truststore`` hands chain validation to macOS Security.framework / Windows
     CryptoAPI (OpenSSL + the system bundle on Linux). Certificates loaded with
     ``load_verify_locations`` are trusted *in addition* to the OS roots, so
-    certifi (``bundled``) and the additive bundle vars stack on top.
+    certifi (``bundled``) and the additive bundle vars stack on top. Built once
+    per configuration and cached.
     """
-    if not _system_store_enabled():
-        return None
     key = (
         tuple(alpn),
         os.environ.get(CERT_STORE_ENV),
@@ -272,31 +282,25 @@ def _system_trust_context(alpn: list[str]) -> ssl.SSLContext | None:
     cached = _system_ctx_cache.get(key)
     if cached is not None:
         return cached
-    try:
-        import truststore
+    import truststore
 
-        ctx: ssl.SSLContext = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        # Match create_default_context() on 3.13+: an explicitly trusted
-        # intermediate (a common "Zscaler Intermediate Root CA" export) is a
-        # valid anchor. Only affects the OpenSSL (Linux) backend.
-        partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
-        if partial_chain:
-            ctx.verify_flags |= partial_chain
-        if "bundled" in cert_store_sources():
-            try:
-                import certifi
+    ctx: ssl.SSLContext = _require_tls12(truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    # Match create_default_context() on 3.13+: an explicitly trusted
+    # intermediate (a common "Zscaler Intermediate Root CA" export) is a
+    # valid anchor. Only affects the OpenSSL (Linux) backend.
+    partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    if partial_chain:
+        ctx.verify_flags |= partial_chain
+    if "bundled" in cert_store_sources():
+        try:
+            import certifi
 
-                ctx.load_verify_locations(cafile=certifi.where())
-            except Exception:  # certifi is optional; the OS store still applies
-                logger.debug("event=ssl_certifi_unavailable")
-        for path in _additive_ca_paths():
-            ctx.load_verify_locations(cafile=path)
-        ctx.set_alpn_protocols(alpn)
-    except Exception as exc:
-        # Never let the OS-store path take the proxy down: fall back to the
-        # bundled behavior and say so.
-        logger.warning("event=ssl_system_store_failed error=%r (falling back to bundled)", exc)
-        return None
+            ctx.load_verify_locations(cafile=certifi.where())
+        except Exception:  # certifi is optional; the OS store still applies
+            logger.debug("event=ssl_certifi_unavailable")
+    for path in _additive_ca_paths():
+        ctx.load_verify_locations(cafile=path)
+    ctx.set_alpn_protocols(alpn)
     _system_ctx_cache[key] = ctx
     return ctx
 
@@ -334,34 +338,68 @@ def _default_strict_relaxed_context() -> ssl.SSLContext:
     tolerate a non-critical ``basicConstraints`` CA. Mirrors what httpx builds
     for ``verify=True`` (default context + ALPN), minus the strict flag.
     """
-    ctx = ssl.create_default_context()
+    ctx = _require_tls12(ssl.create_default_context())
     ctx.set_alpn_protocols(["h2", "http/1.1"])
     return _clear_x509_strict(ctx, reason="env_toggle")
 
 
-def _configured_context(alpn: list[str]) -> ssl.SSLContext | None:
-    """The context Headroom's trust configuration calls for, or None for "library default".
+def _replacement_ca_path() -> str | None:
+    """The existing file named by ``SSL_CERT_FILE``/``REQUESTS_CA_BUNDLE``, if any."""
+    for var in _REPLACEMENT_CA_VARS:
+        path = os.environ.get(var)
+        if path and os.path.isfile(path):
+            return path
+    return None
 
-    Resolution order:
+
+def _has_configured_trust() -> bool:
+    """True when Headroom's trust settings call for something other than a library default."""
+    return (
+        _system_store_enabled()
+        or _replacement_ca_path() is not None
+        or bool(_additive_ca_paths(log=False))
+        or tls_strict_disabled()
+    )
+
+
+def _build_context(alpn: list[str], fallback: Callable[[], ssl.SSLContext]) -> ssl.SSLContext:
+    """Build the verifying context Headroom's trust configuration calls for.
+
+    Every branch returns a concrete, certificate-verifying ``SSLContext``;
+    ``fallback`` supplies the library-default equivalent. Resolution order:
 
     0. The OS trust store (plus certifi and the additive bundle vars) when
        ``HEADROOM_CERT_STORE`` includes ``system`` — the default — and no
        replacement bundle var is set.
-    1. A custom CA bundle env var (``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` /
-       ``NODE_EXTRA_CA_CERTS`` / ``HEADROOM_CA_BUNDLE``) → a context trusting
-       that bundle, with strict mode already relaxed (corporate PKI signal).
-    2. No bundle, but ``HEADROOM_TLS_STRICT=0`` → the default trust store with
-       ``VERIFY_X509_STRICT`` cleared, so a corporate root that's installed in
-       the OS store but trips RFC 5280 strict mode still validates.
+    1. ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` → only that bundle, strict
+       mode relaxed (corporate PKI signal).
+    2. ``HEADROOM_CA_BUNDLE`` / ``NODE_EXTRA_CA_CERTS`` → default roots plus
+       those, strict mode relaxed.
+    3. ``HEADROOM_TLS_STRICT=0`` → the default trust store with
+       ``VERIFY_X509_STRICT`` cleared.
+    4. Otherwise ``fallback()``.
     """
-    system_ctx = _system_trust_context(alpn)
-    if system_ctx is not None:
-        return system_ctx
-    ctx = find_ca_bundle()
-    if ctx is None and tls_strict_disabled():
+    if _system_store_enabled():
+        try:
+            return _build_system_context(alpn)
+        except Exception as exc:
+            # Never let the OS-store path take the proxy down: fall back to the
+            # bundled behavior and say so.
+            logger.warning("event=ssl_system_store_failed error=%r (falling back to bundled)", exc)
+    replacement = _replacement_ca_path()
+    additive = _additive_ca_paths()
+    if replacement is not None:
+        logger.info("event=ssl_ca_bundle_loaded path=%s", replacement)
+        ctx = _replacement_ca_context(replacement)
+    elif additive:
+        ctx = _additive_ca_context(additive[0])
+        for path in additive[1:]:
+            ctx.load_verify_locations(cafile=path)
+    elif tls_strict_disabled():
         ctx = _default_strict_relaxed_context()
-    if ctx is not None:
-        ctx.set_alpn_protocols(alpn)
+    else:
+        ctx = fallback()
+    ctx.set_alpn_protocols(alpn)
     return ctx
 
 
@@ -370,7 +408,7 @@ def _bundled_default_context() -> ssl.SSLContext:
 
     Built here rather than passing ``True`` so every upstream client receives a
     concrete, always-verifying ``SSLContext``: no code path can hand httpx a
-    boolean that could ever be ``False``.
+    value that disables verification.
     """
     cert_dir = os.environ.get("SSL_CERT_DIR")
     if cert_dir:
@@ -379,17 +417,21 @@ def _bundled_default_context() -> ssl.SSLContext:
         import certifi
 
         ctx = ssl.create_default_context(cafile=certifi.where())
-    ctx.set_alpn_protocols(["h2", "http/1.1"])
-    return ctx
+    return _require_tls12(ctx)
+
+
+def _stdlib_default_context() -> ssl.SSLContext:
+    """What ``ssl=True`` / urlopen build: the stdlib default trust store."""
+    return _require_tls12(ssl.create_default_context())
 
 
 def build_httpx_verify() -> ssl.SSLContext:
     """Return the value for httpx's ``verify=`` parameter: always a verifying context.
 
-    Headroom's configured trust (see :func:`_configured_context`) when there is
-    one, else httpx's own default (certifi) built explicitly.
+    Headroom's configured trust (see :func:`_build_context`) when there is one,
+    else httpx's own default (certifi) built explicitly.
     """
-    return _configured_context(["h2", "http/1.1"]) or _bundled_default_context()
+    return _build_context(["h2", "http/1.1"], _bundled_default_context)
 
 
 def build_urlopen_context() -> ssl.SSLContext | None:
@@ -402,7 +444,9 @@ def build_urlopen_context() -> ssl.SSLContext | None:
     offering h2 can make a TLS-inspecting MITM negotiate a protocol it cannot
     parse.
     """
-    return _configured_context(["http/1.1"])
+    if not _has_configured_trust():
+        return None
+    return _build_context(["http/1.1"], _stdlib_default_context)
 
 
 def apply_global_tls_relaxation() -> bool:
@@ -465,11 +509,7 @@ def build_websocket_ssl() -> ssl.SSLContext:
     Without configured trust it is what ``ssl=True`` would build (the stdlib
     default, which on Windows loads the machine store).
     """
-    ctx = _configured_context(["http/1.1"])
-    if ctx is None:
-        ctx = ssl.create_default_context()
-        ctx.set_alpn_protocols(["http/1.1"])
-    return ctx
+    return _build_context(["http/1.1"], _stdlib_default_context)
 
 
 def ensure_process_trust() -> bool:
