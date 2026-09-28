@@ -177,7 +177,7 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.ssl_context import build_httpx_verify, ensure_process_trust
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
@@ -1957,9 +1957,14 @@ class HeadroomProxy(
             operation="proxy.startup",
             metadata={"port": self.config.port, "host": self.config.host},
         )
-        # Resolve TLS verification: a custom CA bundle (corporate PKI) if one
-        # is configured, else a strict-relaxed default context when
+        # Resolve TLS verification: the OS trust store (where IT installs a
+        # corporate TLS-inspection root) plus certifi by default, else a custom
+        # CA bundle, else a strict-relaxed default context when
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
+        # Injection covers the third-party clients that build their own
+        # contexts; it also runs here because uvicorn workers can import the
+        # app without going through the CLI.
+        ensure_process_trust()
         _verify = build_httpx_verify()
         _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
         # `install_upstream_pinning` is what makes the SSRF guard's verdict

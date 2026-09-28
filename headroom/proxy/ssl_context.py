@@ -1,16 +1,27 @@
-"""SSL context builder for the Headroom upstream httpx client.
+"""TLS trust policy for every outbound connection Headroom makes.
 
-Respects the standard CA-bundle environment variables used by Python
-(``SSL_CERT_FILE``), requests (``REQUESTS_CA_BUNDLE``), and Node.js /
-Claude Code (``NODE_EXTRA_CA_CERTS``) so that enterprise / corporate
-deployments with custom certificate authorities work without extra
-configuration.
+Corporate networks (Zscaler, Netskope, Palo Alto, Cisco Secure Access, ...)
+inspect TLS by re-signing every certificate with a company root. IT installs
+that root in the **operating system** trust store (macOS Keychain, Windows
+certificate store), which is why browsers, curl and Claude Code keep working.
+Python does not read that store: httpx trusts certifi's bundle and the stdlib
+reads a static OpenSSL file, so Headroom used to reject the re-signed chain
+and fail every upstream request with ``CERTIFICATE_VERIFY_FAILED``.
 
-Priority order (first match wins):
+Default policy (``HEADROOM_CERT_STORE=system,bundled``, mirroring Claude
+Code's ``CLAUDE_CODE_CERT_STORE``): verify through the OS trust store via
+``truststore`` *and* trust certifi's public bundle. On macOS and Windows the
+OS verifier does the chain check, so a corporate root that IT pushed to the
+machine just works and OpenSSL's strict-mode quirks never apply.
+
+Sources, in the order they are resolved:
 1. ``SSL_CERT_FILE``  — replacement semantics (only these CAs are trusted)
 2. ``REQUESTS_CA_BUNDLE`` — replacement semantics
-3. ``NODE_EXTRA_CA_CERTS`` — **additive** semantics (extra roots loaded
-   on top of the default/system trust store, matching Node.js behavior)
+3. Otherwise the ``HEADROOM_CERT_STORE`` sources (``system``, ``bundled``),
+   plus the **additive** bundles ``HEADROOM_CA_BUNDLE`` and
+   ``NODE_EXTRA_CA_CERTS`` (extra roots on top, matching Node.js behavior).
+
+``HEADROOM_CERT_STORE=bundled`` restores the pre-0.40 behavior (no OS store).
 
 Strict-mode toggle (``HEADROOM_TLS_STRICT``):
     Python 3.13 + OpenSSL 3.x enable ``VERIFY_X509_STRICT`` by default, which
@@ -37,6 +48,17 @@ import ssl
 from typing import Any, cast
 
 logger = logging.getLogger("headroom.proxy")
+
+CERT_STORE_ENV = "HEADROOM_CERT_STORE"
+EXTRA_CA_ENV = "HEADROOM_CA_BUNDLE"
+
+_CERT_STORE_SOURCES = frozenset({"system", "bundled"})
+_DEFAULT_CERT_STORE = frozenset({"system", "bundled"})
+
+# Additive bundles, loaded on top of whatever trust store is in force.
+_ADDITIVE_CA_VARS = (EXTRA_CA_ENV, "NODE_EXTRA_CA_CERTS")
+
+_process_trust_injected = False
 
 _REPLACEMENT_CA_VARS = (
     "SSL_CERT_FILE",
@@ -135,20 +157,139 @@ def find_ca_bundle() -> ssl.SSLContext | None:
                 path,
             )
 
-    node_path = os.environ.get("NODE_EXTRA_CA_CERTS")
-    if node_path and os.path.isfile(node_path):
-        logger.info(
-            "event=ssl_ca_bundle_loaded env_var=NODE_EXTRA_CA_CERTS path=%s additive=true",
-            node_path,
-        )
-        return _additive_ca_context(node_path)
-    if node_path and not os.path.isfile(node_path):
-        logger.warning(
-            "event=ssl_ca_bundle_missing env_var=NODE_EXTRA_CA_CERTS path=%r (skipped)",
-            node_path,
-        )
+    additive = _additive_ca_paths()
+    if additive:
+        ctx = _additive_ca_context(additive[0])
+        for path in additive[1:]:
+            ctx.load_verify_locations(cafile=path)
+        return ctx
 
     return None
+
+
+def _additive_ca_paths() -> list[str]:
+    """Existing files named by the additive CA vars, logging each one once seen."""
+    paths: list[str] = []
+    for var in _ADDITIVE_CA_VARS:
+        path = os.environ.get(var)
+        if not path:
+            continue
+        if os.path.isfile(path):
+            logger.info(
+                "event=ssl_ca_bundle_loaded env_var=%s path=%s additive=true",
+                var,
+                path,
+            )
+            paths.append(path)
+        else:
+            logger.warning(
+                "event=ssl_ca_bundle_missing env_var=%s path=%r (skipped)",
+                var,
+                path,
+            )
+    return paths
+
+
+def _replacement_ca_var_set() -> bool:
+    """True when ``SSL_CERT_FILE``/``REQUESTS_CA_BUNDLE`` name an existing file."""
+    return any(
+        (path := os.environ.get(var)) and os.path.isfile(path) for var in _REPLACEMENT_CA_VARS
+    )
+
+
+def cert_store_sources() -> frozenset[str]:
+    """Trust sources selected by ``HEADROOM_CERT_STORE`` (default: system,bundled).
+
+    Unknown tokens are ignored with a warning; a value with no known token falls
+    back to the default rather than trusting nothing.
+    """
+    raw = os.environ.get(CERT_STORE_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_CERT_STORE
+    tokens = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    unknown = tokens - _CERT_STORE_SOURCES
+    if unknown:
+        logger.warning(
+            "event=ssl_cert_store_unknown env_var=%s ignored=%s",
+            CERT_STORE_ENV,
+            ",".join(sorted(unknown)),
+        )
+    chosen = frozenset(tokens & _CERT_STORE_SOURCES)
+    return chosen or _DEFAULT_CERT_STORE
+
+
+def system_trust_available() -> bool:
+    """True when the ``truststore`` package can verify through the OS store."""
+    try:
+        import truststore  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _system_store_enabled() -> bool:
+    return (
+        "system" in cert_store_sources()
+        and not _replacement_ca_var_set()
+        and system_trust_available()
+    )
+
+
+def _system_trust_context(alpn: list[str]) -> ssl.SSLContext | None:
+    """A context that verifies through the OS trust store, or None if unavailable.
+
+    ``truststore`` hands chain validation to macOS Security.framework / Windows
+    CryptoAPI (OpenSSL + the system bundle on Linux). Certificates loaded with
+    ``load_verify_locations`` are trusted *in addition* to the OS roots, so
+    certifi (``bundled``) and the additive bundle vars stack on top.
+    """
+    if not _system_store_enabled():
+        return None
+    try:
+        import truststore
+
+        ctx: ssl.SSLContext = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if "bundled" in cert_store_sources():
+            try:
+                import certifi
+
+                ctx.load_verify_locations(cafile=certifi.where())
+            except Exception:  # certifi is optional; the OS store still applies
+                logger.debug("event=ssl_certifi_unavailable")
+        for path in _additive_ca_paths():
+            ctx.load_verify_locations(cafile=path)
+        ctx.set_alpn_protocols(alpn)
+    except Exception as exc:
+        # Never let the OS-store path take the proxy down: fall back to the
+        # bundled behavior and say so.
+        logger.warning("event=ssl_system_store_failed error=%r (falling back to bundled)", exc)
+        return None
+    return ctx
+
+
+def describe_trust_policy() -> dict[str, Any]:
+    """What trust configuration is in force, for ``/health`` and ``doctor``."""
+    replacement = next(
+        (
+            {"env_var": var, "path": os.environ[var]}
+            for var in _REPLACEMENT_CA_VARS
+            if os.environ.get(var) and os.path.isfile(os.environ[var])
+        ),
+        None,
+    )
+    return {
+        "cert_store": sorted(cert_store_sources()),
+        "system_store_available": system_trust_available(),
+        "system_store_active": _system_store_enabled(),
+        "replacement_bundle": replacement,
+        "additive_bundles": [
+            {"env_var": var, "path": os.environ[var]}
+            for var in _ADDITIVE_CA_VARS
+            if os.environ.get(var) and os.path.isfile(os.environ[var])
+        ],
+        "tls_strict_disabled": tls_strict_disabled(),
+        "process_injected": _process_trust_injected,
+    }
 
 
 def _default_strict_relaxed_context() -> ssl.SSLContext:
@@ -169,6 +310,9 @@ def build_httpx_verify() -> ssl.SSLContext | bool:
 
     Resolution order:
 
+    0. The OS trust store (plus certifi and the additive bundle vars) when
+       ``HEADROOM_CERT_STORE`` includes ``system`` — the default — and no
+       replacement bundle var is set.
     1. A custom CA bundle env var (``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` /
        ``NODE_EXTRA_CA_CERTS``) → a context trusting that bundle, with strict
        mode already relaxed (corporate PKI signal).
@@ -180,6 +324,9 @@ def build_httpx_verify() -> ssl.SSLContext | bool:
     Returning ``True`` rather than a hand-built context in the common case
     keeps httpx's own default behavior (including its certifi fallback) intact.
     """
+    system_ctx = _system_trust_context(["h2", "http/1.1"])
+    if system_ctx is not None:
+        return system_ctx
     ca_ctx = find_ca_bundle()
     if ca_ctx is not None:
         return ca_ctx
@@ -197,6 +344,9 @@ def build_urlopen_context() -> ssl.SSLContext | None:
     handling when it is configured.
     """
 
+    system_ctx = _system_trust_context(["http/1.1"])
+    if system_ctx is not None:
+        return system_ctx
     verify = build_httpx_verify()
     if not isinstance(verify, ssl.SSLContext):
         return None
@@ -256,4 +406,50 @@ def apply_global_tls_relaxation() -> bool:
     _relaxed_create_urllib3_context._headroom_strict_relaxed = True  # type: ignore[attr-defined]
     _u3ssl.create_urllib3_context = _relaxed_create_urllib3_context  # type: ignore[assignment]
     logger.info("event=ssl_x509_strict_disabled reason=urllib3_global_patch")
+    return True
+
+
+def build_websocket_ssl() -> ssl.SSLContext | bool:
+    """Return the value for ``websockets.connect(ssl=...)`` on a ``wss://`` URL.
+
+    WebSocket upgrades are HTTP/1.1, so the context only offers ``http/1.1``.
+    Falls back to ``True`` (the websockets default, which on Windows loads the
+    machine store) when neither the OS store nor a custom bundle applies.
+    """
+    system_ctx = _system_trust_context(["http/1.1"])
+    if system_ctx is not None:
+        return system_ctx
+    ctx = build_urlopen_context()
+    return ctx if ctx is not None else True
+
+
+def ensure_process_trust() -> bool:
+    """Make every TLS client in this *application* process use the OS store.
+
+    Headroom's own upstream clients get an explicit context from the builders
+    above, but third-party code (``huggingface_hub`` model downloads, tiktoken
+    vocab fetches, OTEL exporters, ...) builds its own. ``truststore``'s
+    process-wide injection covers those in one place instead of chasing every
+    call site. It is only ever called from Headroom's entry points (CLI and
+    proxy startup) — never on library import — because injecting into an
+    embedding application's process is not ours to decide.
+
+    Skipped when the operator pinned a replacement bundle (``SSL_CERT_FILE`` /
+    ``REQUESTS_CA_BUNDLE``) or opted out via ``HEADROOM_CERT_STORE``.
+    Idempotent. Returns True when injection is in place.
+    """
+    global _process_trust_injected
+    if _process_trust_injected:
+        return True
+    if not _system_store_enabled():
+        return False
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception as exc:
+        logger.warning("event=ssl_process_trust_failed error=%r", exc)
+        return False
+    _process_trust_injected = True
+    logger.info("event=ssl_process_trust_injected source=os_trust_store")
     return True
