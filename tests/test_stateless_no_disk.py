@@ -235,10 +235,15 @@ def test_savings_ledger_not_written_under_stateless(workspace, tmp_path):
 
     target = tmp_path / "events.jsonl"
     paths.set_process_stateless(True)
-    savings_ledger.record_savings_event(tokens_before=100, tokens_after=10, path=target)
+    assert (
+        savings_ledger.record_savings_event(tokens_before=100, tokens_after=10, path=target)
+        is False
+    )
     assert not target.exists()
     paths.set_process_stateless(False)
-    savings_ledger.record_savings_event(tokens_before=100, tokens_after=10, path=target)
+    assert (
+        savings_ledger.record_savings_event(tokens_before=100, tokens_after=10, path=target) is True
+    )
     assert target.exists()
 
 

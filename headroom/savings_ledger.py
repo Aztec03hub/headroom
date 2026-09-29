@@ -396,7 +396,7 @@ def record_savings_event(
                 event["cost_usd"] = round(list_usd, 6)
 
     if not _paths.persistence_allowed("savings ledger"):
-        return
+        return False
     target = _resolve_path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
