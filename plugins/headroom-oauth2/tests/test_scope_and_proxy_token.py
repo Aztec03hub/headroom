@@ -282,7 +282,9 @@ def test_install_passes_extra_local_paths(monkeypatch):
 def test_install_log_line_does_not_carry_the_token_url_query(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="headroom_oauth2")
     _capture_install(monkeypatch)
-    assert "https://idp.example.com" in caplog.text
+    [record] = [r for r in caplog.records if "auth installed" in r.getMessage()]
+    # The logged token_url is exactly scheme://host -- no path, no query.
+    assert record.args[0] == "https://idp.example.com"
     assert "client=acme" not in caplog.text
     assert "/token" not in caplog.text
 
