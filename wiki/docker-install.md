@@ -73,8 +73,9 @@ docker run --rm -it \
   --host 0.0.0.0 --port 8787
 ```
 
-The maintained wrappers (`headroom install`, `docker/docker-compose.native.yml`)
-set that acknowledgement themselves because they always publish on loopback.
+The maintained wrappers (`headroom install`, the `install.sh` / `install.ps1`
+native wrappers, and `docker/docker-compose.native.yml`) set that acknowledgement
+themselves, and only together with the `127.0.0.1` publication it depends on.
 
 For deliberate public access, publish on an explicit public address and set
 `HEADROOM_PROXY_TOKEN`:
