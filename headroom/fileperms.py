@@ -227,10 +227,12 @@ def connect_private_sqlite(
     module should create. The parent directory must already exist; create it
     with :func:`private_dir` if it is dedicated to this store.
     """
-    if connect_kwargs.get("uri") or _is_sqlite_uri_or_memory(path):
-        return sqlite3.connect(os.fspath(path), **connect_kwargs)
-    ensure_private_file(path, what=what)
-    return sqlite3.connect(os.fspath(path), **connect_kwargs)
+    if not (connect_kwargs.get("uri") or _is_sqlite_uri_or_memory(path)):
+        ensure_private_file(path, what=what)
+    # ``**connect_kwargs: Any`` makes mypy type the call as ``Any``; the
+    # annotation pins it back to the real return type.
+    conn: sqlite3.Connection = sqlite3.connect(os.fspath(path), **connect_kwargs)
+    return conn
 
 
 def private_dir(path: str | os.PathLike[str], *, tighten: bool = False) -> Path:

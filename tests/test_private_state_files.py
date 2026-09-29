@@ -213,13 +213,20 @@ class TestMemoryStoresArePrivate:
         assert _mode(p) == 0o600
 
     def test_hnsw_metadata_dump(self, tmp_path):
-        pytest.importorskip("hnswlib")
+        # Never ``importorskip("hnswlib")`` here: on runners without AVX the
+        # native import dies with SIGILL and takes the whole pytest shard with
+        # it. The adapter's probe runs the import in a subprocess.
+        import asyncio
+
+        from headroom.memory.adapters.hnsw import _check_hnswlib_available
+
+        if not _check_hnswlib_available():
+            pytest.skip("hnswlib not available (or not usable on this CPU)")
+
         import numpy as np
 
         from headroom.memory.adapters.hnsw import HNSWVectorIndex
         from headroom.memory.models import Memory
-
-        import asyncio
 
         index = HNSWVectorIndex(dimension=4, max_elements=16)
         mem = Memory(content="secret fact", user_id="alice", embedding=np.ones(4, dtype=np.float32))
