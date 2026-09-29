@@ -60,7 +60,7 @@ from ..config import (
     RelevanceScorerConfig,
     TransformResult,
     is_tool_excluded,
-    unwrap_tool_call_name,
+    unwrap_tool_call,
 )
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
@@ -5069,16 +5069,17 @@ class ContentRouter(Transform):
                     tc_id = tc.get("id", "")
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
+                    call_args = fn.get("arguments")
                     if name:
                         # Hermes deferred tools arrive wrapped as `tool_call`
-                        # with the real name inside the arguments payload.
-                        name = unwrap_tool_call_name(name, fn.get("arguments"))
+                        # with the real name and arguments inside the payload.
+                        name, call_args = unwrap_tool_call(name, call_args)
                     if tc_id and name:
                         mapping[tc_id] = name
-                        args = _tool_call_args_text(fn.get("arguments"))
+                        args = _tool_call_args_text(call_args)
                         if args:
                             args_map[tc_id] = args
-                        command = _tool_call_command_text(fn.get("arguments"))
+                        command = _tool_call_command_text(call_args)
                         if command:
                             commands_map[tc_id] = command
 
@@ -5089,16 +5090,17 @@ class ContentRouter(Transform):
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tc_id = block.get("id", "")
                         name = block.get("name", "")
+                        call_input = block.get("input")
                         if name:
                             # Hermes deferred tools arrive wrapped as `tool_call`
-                            # with the real name inside the input payload.
-                            name = unwrap_tool_call_name(name, block.get("input"))
+                            # with the real name and arguments inside the input.
+                            name, call_input = unwrap_tool_call(name, call_input)
                         if tc_id and name:
                             mapping[tc_id] = name
-                            args = _tool_call_args_text(block.get("input"))
+                            args = _tool_call_args_text(call_input)
                             if args:
                                 args_map[tc_id] = args
-                            command = _tool_call_command_text(block.get("input"))
+                            command = _tool_call_command_text(call_input)
                             if command:
                                 commands_map[tc_id] = command
 
