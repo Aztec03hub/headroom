@@ -166,7 +166,9 @@ function Get-PassthroughEnvArgs {
 # and it is always made together with the 127.0.0.1 publication it relies on.
 function Get-LoopbackPublishArgs {
     param([int]$Port)
-    return [string[]]@('-p',"127.0.0.1`:$Port`:$Port",'--env','HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1')
+    # Leading comma: return the array as one object so AddRange receives a
+    # string[] rather than an unrolled object[] (same as Get-SharedDockerArgs).
+    return ,[string[]]@('-p',"127.0.0.1`:$Port`:$Port",'--env','HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1')
 }
 
 function Get-SharedDockerArgs {

@@ -445,6 +445,9 @@ def test_wrappers_acknowledge_open_bind_only_with_loopback_publication() -> None
         "\n}\n", 1
     )[0]
     assert "127.0.0.1`:$Port`:$Port" in ps_helper and ack in ps_helper
+    # Without the unary comma PowerShell unrolls the array to object[], and
+    # List[string].AddRange rejects it at runtime.
+    assert "return ,[string[]]@(" in ps_helper
     ps_outside = powershell_source.replace(ps_helper, "")
     assert "'-p'," not in ps_outside.replace("Get-LoopbackPublishArgs", "")
     assert ps_outside.count(ack) == 0
