@@ -82,5 +82,5 @@ def test_tool_schema_layer_carries_its_dollar_value(tmp_path, monkeypatch):
         layer = client.get("/stats").json()["savings"]["by_layer"]["tool_search"]
 
     assert layer["tokens"] >= 0  # window-scoped; the dollars are lifetime
-    assert "usd" in layer
-    assert layer["usd"] >= 0.0
+    assert "usd" not in layer
+    assert layer["lifetime_usd"] >= 0.0

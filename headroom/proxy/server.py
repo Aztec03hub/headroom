@@ -4558,14 +4558,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         # Priced at what those tokens would actually have been
                         # billed at (provider cache-read rate for the warm turns,
                         # cache-write for the cold one), not at list input.
-                        "usd": round(tool_schema_usd, 4),
+                    "lifetime_usd": round(tool_schema_usd, 4),
                         "description": (
                             "Tool-definition tokens kept out of the model's context "
                             "by deferring heavy tool schemas until they're searched "
                             "for. Counted only when Headroom performed the deferral — "
-                            "not when the client (e.g. Claude Code / Codex) already "
-                            "had tool search enabled. Aggregated over the recent "
-                            "request window."
+                        "not when the client (e.g. Claude Code / Codex) already "
+                        "had tool search enabled. Token and request counts use "
+                        "the recent request window; lifetime_usd covers the "
+                        "full process lifetime."
                         ),
                     },
                 },
