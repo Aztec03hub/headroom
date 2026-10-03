@@ -140,6 +140,9 @@ impl SearchMatch {
 pub struct FileMatches {
     pub file: String,
     pub matches: Vec<SearchMatch>,
+    /// Position of the file's first row among the input's files: output
+    /// follows it, and it breaks score ties (key order is not input order).
+    pub order: usize,
 }
 
 impl FileMatches {
@@ -147,6 +150,7 @@ impl FileMatches {
         Self {
             file: file.into(),
             matches: Vec::new(),
+            order: 0,
         }
     }
 
@@ -382,9 +386,10 @@ impl SearchCompressor {
         stats: &mut SearchCompressorStats,
     ) -> BTreeMap<String, FileMatches> {
         let mut out: BTreeMap<String, FileMatches> = BTreeMap::new();
-        for raw in content.split('\n') {
-            let line = raw.trim();
-            if line.is_empty() {
+        for line in content.split('\n') {
+            // Parse the raw line: trimming it stripped every kept row's
+            // trailing whitespace (and any `\r`), so rows were not verbatim.
+            if line.trim().is_empty() {
                 continue;
             }
             stats.lines_scanned += 1;
@@ -392,8 +397,12 @@ impl SearchCompressor {
                 Some((file, line_no, body)) => {
                     let mut m = SearchMatch::new(file, line_no, body);
                     m.marker = line[file.len()..line.len() - body.len()].to_string();
+                    let order = out.len();
                     out.entry(file.to_string())
-                        .or_insert_with(|| FileMatches::new(file))
+                        .or_insert_with(|| FileMatches {
+                            order,
+                            ..FileMatches::new(file)
+                        })
                         .matches
                         .push(m);
                 }
@@ -472,6 +481,7 @@ impl SearchCompressor {
             b.1.total_score()
                 .partial_cmp(&a.1.total_score())
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.order.cmp(&b.1.order))
         });
 
         if by_score.len() > self.config.max_files {
@@ -573,6 +583,7 @@ impl SearchCompressor {
                 FileMatches {
                     file: file.clone(),
                     matches: file_selected,
+                    order: fm.order,
                 },
             );
         }
@@ -589,7 +600,9 @@ impl SearchCompressor {
         let mut summaries: BTreeMap<String, String> = BTreeMap::new();
         let grouped = self.config.group_by_file;
 
-        for (file, fm) in selected {
+        let mut in_order: Vec<(&String, &FileMatches)> = selected.iter().collect();
+        in_order.sort_by_key(|(_, fm)| fm.order);
+        for (file, fm) in in_order {
             if grouped {
                 // `rg --heading` style: path once, then line:content rows.
                 if !lines.is_empty() {
@@ -1378,7 +1391,9 @@ logs/2026-05-04/app.log:7:ERROR bang";
         // sharing a number included), and the old renderers would fail.
         let mut lines: Vec<String> = Vec::new();
         for i in 1..60 {
-            lines.push(format!("src/a.py:{i}:def f{i}(): pass"));
+            // trailing spaces on some rows: kept rows must keep them
+            let pad = "  ";
+            lines.push(format!("src/a.py:{i}:def f{i}(): pass{pad}"));
             lines.push(format!("src/a.py-{}-ctx {i}", i + 100));
         }
         for s in 1..60 {
@@ -1395,8 +1410,9 @@ logs/2026-05-04/app.log:7:ERROR bang";
             };
             let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
             let mut heading = String::new();
-            // Files are emitted in score order; input order holds per file.
+            // Rows keep input order per file; files keep first-appearance order.
             let mut last: BTreeMap<String, usize> = BTreeMap::new();
+            let mut files_seen: Vec<String> = Vec::new();
             let mut kept = 0;
             // Grouped: a heading is the first line or follows a blank line.
             let mut at_heading = true;
@@ -1425,17 +1441,61 @@ logs/2026-05-04/app.log:7:ERROR bang";
                 let p = pos(&full)
                     .unwrap_or_else(|| panic!("grouped={grouped}: {full:?} is not an input line"));
                 let file = parse_match_line(&full).unwrap().0.to_string();
+                if !files_seen.contains(&file) {
+                    files_seen.push(file.clone());
+                }
                 if let Some(l) = last.insert(file, p) {
                     assert!(l < p, "grouped={grouped}: {full:?} out of input order");
                 }
                 kept += 1;
             }
             assert!(kept > 10, "grouped={grouped}: only {kept} rows kept");
+            let first_at = |f: &String| {
+                lines
+                    .iter()
+                    .position(|l| parse_match_line(l).unwrap().0 == f)
+            };
+            let mut sorted_files = files_seen.clone();
+            sorted_files.sort_by_key(first_at);
+            assert_eq!(
+                files_seen, sorted_files,
+                "grouped={grouped}: files out of input order"
+            );
+            assert!(r.compressed.contains("pass  "), "trailing spaces lost");
             assert!(
                 r.compressed.contains("-ctx "),
                 "a context row should survive"
             );
         }
+    }
+
+    #[test]
+    fn max_files_keeps_the_earliest_files_on_equal_scores() {
+        // Key order (`pkg10` < `pkg2`) used to decide which tied files the
+        // `max_files` cap dropped; it is the first files in the input now.
+        let content: String = (0..20)
+            .map(|i| format!("pkg{i}/mod.py:7:value = {i}\n"))
+            .collect();
+        let cfg = SearchCompressorConfig {
+            max_files: 5,
+            ..SearchCompressorConfig::default()
+        };
+        let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
+        let kept: Vec<&str> = r
+            .compressed
+            .lines()
+            .filter_map(|l| parse_match_line(l).map(|m| m.0))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "pkg0/mod.py",
+                "pkg1/mod.py",
+                "pkg2/mod.py",
+                "pkg3/mod.py",
+                "pkg4/mod.py"
+            ]
+        );
     }
 
     #[test]
