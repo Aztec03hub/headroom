@@ -112,6 +112,10 @@ pub struct SearchMatch {
     pub content: String,
     /// Relevance score in [0.0, 1.0]; populated by [`SearchCompressor::score_matches`].
     pub score: f32,
+    /// The `<sep><digits><sep>` text exactly as it appeared between path and
+    /// content. Output reuses it so a context line (`-`) stays a context line
+    /// and the digits are never re-formatted.
+    pub marker: String,
 }
 
 impl SearchMatch {
@@ -121,7 +125,13 @@ impl SearchMatch {
             line_number,
             content: content.into(),
             score: 0.0,
+            marker: format!(":{line_number}:"),
         }
+    }
+
+    /// `file<marker>content`, byte-identical to the parsed line.
+    pub fn render(&self) -> String {
+        format!("{}{}{}", self.file, self.marker, self.content)
     }
 }
 
@@ -380,10 +390,12 @@ impl SearchCompressor {
             stats.lines_scanned += 1;
             match parse_match_line(line) {
                 Some((file, line_no, body)) => {
+                    let mut m = SearchMatch::new(file, line_no, body);
+                    m.marker = line[file.len()..line.len() - body.len()].to_string();
                     out.entry(file.to_string())
                         .or_insert_with(|| FileMatches::new(file))
                         .matches
-                        .push(SearchMatch::new(file, line_no, body));
+                        .push(m);
                 }
                 None => stats.lines_unparsed += 1,
             }
@@ -469,11 +481,7 @@ impl SearchCompressor {
 
         let all_match_strings: Vec<String> = by_score
             .iter()
-            .flat_map(|(file, fm)| {
-                fm.matches
-                    .iter()
-                    .map(move |m| format!("{}:{}:{}", file, m.line_number, m.content))
-            })
+            .flat_map(|(_, fm)| fm.matches.iter().map(|m| m.render()))
             .collect();
         let all_refs: Vec<&str> = all_match_strings.iter().map(|s| s.as_str()).collect();
         let adaptive_total =
@@ -581,11 +589,11 @@ impl SearchCompressor {
                 }
                 lines.push(file.clone());
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}", m.line_number, m.content));
+                    lines.push(format!("{}{}", &m.marker[1..], m.content));
                 }
             } else {
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}:{}", m.file, m.line_number, m.content));
+                    lines.push(m.render());
                 }
             }
             if let Some(orig_fm) = original.get(file) {
@@ -810,7 +818,12 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
             }
             // The closing separator must match the opening one: grep
             // emits `file:12:body` or `file-12-body`, never a mix.
+            // grep/ripgrep line numbers start at 1 and never carry a leading
+            // zero. A `0`-led run is a clock or date field (`12:00:01`,
+            // `2026-10-03 12:05:00`), not a line marker; accepting it would
+            // print it back as an integer and rewrite the time (`12:0:01`).
             let closes = j > digits_start
+                && bytes[digits_start] != b'0'
                 && j < bytes.len()
                 && match tier {
                     ScanTier::Permissive => bytes[j] == b':' || bytes[j] == b'-',
@@ -1209,6 +1222,57 @@ logs/2026-05-04/app.log:7:ERROR bang";
         assert!(parse_line("src/file.py:-1:invalid").is_none());
         // Equivalent form with the dash adjacent to the dash separator.
         assert!(parse_line("src/file.py--1-invalid").is_none());
+    }
+
+    #[test]
+    fn rejects_zero_led_line_numbers() {
+        // Clock/date fields are `0`-padded; grep line numbers never are.
+        // Parsing `12:00:01` as file `12`, line `00` printed it back as
+        // `12:0:01`, silently rewriting the time.
+        for line in [
+            "12:00:01.123Z ERROR worker failed job 1",
+            "app|12:00:01|ERROR job 1 failed",
+            "2026-10-03 12:05:00 INFO step",
+            "<td>12:00:01</td><td>ERROR</td>",
+        ] {
+            if let Some(m) = parse_line(line) {
+                assert!(
+                    !m.0.bytes().all(|b| b.is_ascii_digit()) || m.1 >= 10,
+                    "{line:?} parsed a clock field as a line number: {m:?}"
+                );
+            }
+        }
+        assert!(parse_line("src/a.py:012:x").is_none());
+        // Real rows still parse, including one whose content is a time.
+        let m = parse_line("src/a.py:12:12:00:01 is noon").unwrap();
+        assert_eq!(
+            (m.0.as_str(), m.1, m.2.as_str()),
+            ("src/a.py", 12, "12:00:01 is noon")
+        );
+        assert_eq!(parse_line("src/a.py:120:x").unwrap().1, 120);
+    }
+
+    #[test]
+    fn rendering_reproduces_each_parsed_line_byte_for_byte() {
+        // Output used to be re-assembled as `file:N:content`, turning a
+        // context line into a match line and a date into `2026:10:03`.
+        let content = "src/a.py:12:match\nsrc/a.py-13-context\n2026-10-03 12:05:00 INFO step\nC:\\x\\b.rs:7:win";
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+        let mut rendered: Vec<String> = parsed
+            .values()
+            .flat_map(|fm| fm.matches.iter().map(|m| m.render()))
+            .collect();
+        let mut want: Vec<&str> = content.split('\n').collect();
+        rendered.sort();
+        want.sort();
+        assert_eq!(rendered, want);
+        let a = &parsed["src/a.py"].matches;
+        assert_eq!(
+            format!("{}{}", &a[1].marker[1..], a[1].content),
+            "13-context"
+        );
     }
 
     #[test]
