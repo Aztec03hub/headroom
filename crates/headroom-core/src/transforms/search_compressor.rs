@@ -553,8 +553,16 @@ impl SearchCompressor {
                 push_unique(m, &mut file_selected, &mut seen);
             }
 
-            // Restore line order for output.
-            file_selected.sort_by_key(|m| m.line_number);
+            // Restore INPUT order for output (grep emits line order, so this is
+            // line order for real grep). Sorting by line number alone put the
+            // forced first/last rows ahead of any rows sharing their number,
+            // e.g. `api:12:00:03 ...` log rows whose "line" is the hour.
+            let file_selected: Vec<SearchMatch> = fm
+                .matches
+                .iter()
+                .filter(|m| seen.remove(&(m.line_number, hash_u64(&m.content))))
+                .cloned()
+                .collect();
 
             let dropped_here = fm.matches.len().saturating_sub(file_selected.len());
             stats.matches_dropped_by_per_file_cap += dropped_here;
@@ -822,6 +830,8 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
             // zero. A `0`-led run is a clock or date field (`12:00:01`,
             // `2026-10-03 12:05:00`), not a line marker; accepting it would
             // print it back as an integer and rewrite the time (`12:0:01`).
+            // Cost: `grep -b` without `-n` prints byte offset 0 for a file's
+            // first line; that one row is left unparsed.
             let closes = j > digits_start
                 && bytes[digits_start] != b'0'
                 && j < bytes.len()
@@ -1250,6 +1260,73 @@ logs/2026-05-04/app.log:7:ERROR bang";
             ("src/a.py", 12, "12:00:01 is noon")
         );
         assert_eq!(parse_line("src/a.py:120:x").unwrap().1, 120);
+    }
+
+    #[test]
+    fn compress_output_rows_are_verbatim_and_in_input_order() {
+        // Through `compress` in both layouts: every kept row is one of the
+        // input lines unchanged, kept rows keep their input order (rows
+        // sharing a number included), and the old renderers would fail.
+        let mut lines: Vec<String> = Vec::new();
+        for i in 1..60 {
+            lines.push(format!("src/a.py:{i}:def f{i}(): pass"));
+            lines.push(format!("src/a.py-{}-ctx {i}", i + 100));
+        }
+        for s in 1..60 {
+            let svc = ["api", "db", "web"][s % 3];
+            lines.push(format!("{svc}:12:{:02}:{:02} job {s} done", s / 60, s % 60));
+        }
+        lines.push("2026-10-03 12:05:00 INFO step".into());
+        let content = lines.join("\n");
+        let pos = |l: &str| lines.iter().position(|x| x == l);
+        for grouped in [false, true] {
+            let cfg = SearchCompressorConfig {
+                group_by_file: grouped,
+                ..SearchCompressorConfig::default()
+            };
+            let (r, _) = SearchCompressor::new(cfg).compress(&content, "", 1.0);
+            let mut heading = String::new();
+            // Files are emitted in score order; input order holds per file.
+            let mut last: BTreeMap<String, usize> = BTreeMap::new();
+            let mut kept = 0;
+            // Grouped: a heading is the first line or follows a blank line.
+            let mut at_heading = true;
+            for row in r.compressed.lines() {
+                if row.is_empty() {
+                    at_heading = true;
+                    continue;
+                }
+                if row.starts_with('[') {
+                    continue;
+                }
+                let full = if grouped && at_heading {
+                    heading = row.to_string();
+                    at_heading = false;
+                    continue;
+                } else if grouped {
+                    // The heading drops the marker's leading separator.
+                    [':', '-']
+                        .iter()
+                        .map(|s| format!("{heading}{s}{row}"))
+                        .find(|f| pos(f).is_some())
+                        .unwrap_or_else(|| format!("{heading}?{row}"))
+                } else {
+                    row.to_string()
+                };
+                let p = pos(&full)
+                    .unwrap_or_else(|| panic!("grouped={grouped}: {full:?} is not an input line"));
+                let file = parse_match_line(&full).unwrap().0.to_string();
+                if let Some(l) = last.insert(file, p) {
+                    assert!(l < p, "grouped={grouped}: {full:?} out of input order");
+                }
+                kept += 1;
+            }
+            assert!(kept > 10, "grouped={grouped}: only {kept} rows kept");
+            assert!(
+                r.compressed.contains("-ctx "),
+                "a context row should survive"
+            );
+        }
     }
 
     #[test]
