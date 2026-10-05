@@ -116,6 +116,10 @@ pub struct SearchMatch {
     /// content. Output reuses it so a context line (`-`) stays a context line
     /// and the digits are never re-formatted.
     pub marker: String,
+    /// Leading whitespace before the path, as it appeared (usually empty).
+    /// Parsing runs on the line without it, so an indented row splits like
+    /// any other; output puts it back.
+    pub indent: String,
 }
 
 impl SearchMatch {
@@ -126,12 +130,16 @@ impl SearchMatch {
             content: content.into(),
             score: 0.0,
             marker: format!(":{line_number}:"),
+            indent: String::new(),
         }
     }
 
-    /// `file<marker>content`, byte-identical to the parsed line.
+    /// `indent file<marker>content`, byte-identical to the parsed line.
     pub fn render(&self) -> String {
-        format!("{}{}{}", self.file, self.marker, self.content)
+        format!(
+            "{}{}{}{}",
+            self.indent, self.file, self.marker, self.content
+        )
     }
 }
 
@@ -387,16 +395,21 @@ impl SearchCompressor {
     ) -> BTreeMap<String, FileMatches> {
         let mut out: BTreeMap<String, FileMatches> = BTreeMap::new();
         for line in content.split('\n') {
-            // Parse the raw line: trimming it stripped every kept row's
-            // trailing whitespace (and any `\r`), so rows were not verbatim.
+            // Keep the trailing whitespace (and any `\r`): trimming it made
+            // kept rows differ from the input. Leading whitespace is set
+            // aside instead: the colon/dash tiers stop at whitespace before a
+            // separator, so an indented row would fall to the permissive tier
+            // and split inside its path (`  logs/2026-12-13/app.log:12:x`).
             if line.trim().is_empty() {
                 continue;
             }
             stats.lines_scanned += 1;
-            match parse_match_line(line) {
+            let rest = line.trim_start();
+            match parse_match_line(rest) {
                 Some((file, line_no, body)) => {
                     let mut m = SearchMatch::new(file, line_no, body);
-                    m.marker = line[file.len()..line.len() - body.len()].to_string();
+                    m.marker = rest[file.len()..rest.len() - body.len()].to_string();
+                    m.indent = line[..line.len() - rest.len()].to_string();
                     let order = out.len();
                     out.entry(file.to_string())
                         .or_insert_with(|| FileMatches {
@@ -901,7 +914,7 @@ fn scan_marker(line: &str, tier: ScanTier) -> Option<(Marker, bool)> {
             // grep/ripgrep line numbers start at 1 and never carry a leading
             // zero. A `0`-led run is a clock or date field (`12:00:01`,
             // `2026-10-03 12:05:00`), not a line marker; accepting it would
-            // print it back as an integer and rewrite the time (`12:0:01`).
+            // group the row under a made-up file and line number.
             // Cost: `grep -b` without `-n` prints byte offset 0 for a file's
             // first line; that one row is left unparsed.
             let closes = j > digits_start
@@ -1354,6 +1367,26 @@ logs/2026-05-04/app.log:7:ERROR bang";
         assert!(parse_line("src/file.py:-1:invalid").is_none());
         // Equivalent form with the dash adjacent to the dash separator.
         assert!(parse_line("src/file.py--1-invalid").is_none());
+    }
+
+    #[test]
+    fn indented_rows_split_at_the_real_marker_and_render_verbatim() {
+        let c = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let input =
+            "  logs/2026-12-13/app.log:12:ERROR one\n  src/my-2-x.py:12:y\nsrc/my-2-x.py:13:z\n";
+        let files = c.parse_search_results(input, &mut stats);
+        let log = &files["logs/2026-12-13/app.log"].matches[0];
+        assert_eq!((log.line_number, log.content.as_str()), (12, "ERROR one"));
+        assert_eq!(log.render(), "  logs/2026-12-13/app.log:12:ERROR one");
+        let py = &files["src/my-2-x.py"].matches;
+        assert_eq!(
+            py.len(),
+            2,
+            "indented and unindented rows share one file group"
+        );
+        assert_eq!(py[0].render(), "  src/my-2-x.py:12:y");
+        assert_eq!(py[1].render(), "src/my-2-x.py:13:z");
     }
 
     #[test]
