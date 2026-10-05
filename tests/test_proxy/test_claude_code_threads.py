@@ -1000,6 +1000,70 @@ def test_tools_omitted_mid_thread_stay_pinned_when_resent_with_a_reference(monke
     assert "no longer available" not in json.dumps(sent["messages"])
 
 
+def test_resent_tools_after_an_unrecorded_turn_get_no_repair_against_dropped_tools(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """The previous turn was never recorded (restart, eviction, a token refresh changes
+    the scope) and omitted tools, so the next turn's resent tools are dropped; injection
+    and history repair must judge on what is forwarded, not on what the client sent."""
+    _sticky(monkeypatch, inject=False)
+    for name in ("_thread_pinned", "_blobs", "_blob_refs"):
+        monkeypatch.setattr(tool_name_registry, name, type(getattr(tool_name_registry, name))())
+    first = _continue_body([{"role": "user", "content": "y"}])
+    first["thread"] = {"type": "continue", "previous_message_id": "msg_never_seen"}
+    _run_turn(first, "msg_unrec_2")
+    ref = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_unrec",
+                    "content": [{"type": "tool_reference", "tool_name": "mcp__x__y"}],
+                }
+            ],
+        }
+    ]
+    tools = [{"name": "mcp__x__y", "description": "d", "input_schema": {"type": "object"}}]
+    last = _continue_body(ref, tools=tools)
+    last["thread"] = {"type": "continue", "previous_message_id": "msg_unrec_2"}
+    sent = _run_turn(last, "msg_unrec_3")
+    assert "tools" not in sent, "the stored thread's tools are unknown: none are sent"
+    assert "tool_reference" in json.dumps(sent["messages"])
+    assert "no longer available" not in json.dumps(sent["messages"])
+
+
+def test_registry_records_and_inherits_the_proxys_memory_tools() -> None:
+    body = {"thread": CONTINUE, "tools": [{"name": "t"}]}
+    pinned = tool_name_registry.thread_pinned_of(body, None, frozenset({"memory_save"}))
+    assert json.loads(pinned["server_memory"]) == ["memory_save"]
+    prev = {"tools": [{"name": "t"}], "server_memory": ["memory_save"]}
+    kept = tool_name_registry.thread_pinned_of({"thread": CONTINUE}, prev, frozenset())
+    assert json.loads(kept["server_memory"]) == ["memory_save"], "empty this turn: inherited"
+    assert "server_memory" not in tool_name_registry.thread_pinned_of(body)
+
+
+def test_continue_from_a_streamed_memory_turn_follows_the_alias(monkeypatch) -> None:  # noqa: ANN001
+    """The client continues from the id it saw (round one); the proxy sends the thread's
+    real latest message and pins what that message was recorded with."""
+    _sticky(monkeypatch, inject=False)
+    recorded = [{"name": "recorded", "description": "d", "input_schema": {"type": "object"}}]
+    tool_name_registry.record_thread_pinned(
+        S,
+        "msg_alias_last",
+        tool_name_registry.thread_pinned_of({"thread": CONTINUE, "tools": recorded}),
+    )
+    tool_name_registry.record_thread_alias(S, "msg_alias_shown", "msg_alias_last")
+    cont = _continue_body([{"role": "user", "content": "x"}], tools=_tools_needing_compaction())
+    cont["thread"] = {"type": "continue", "previous_message_id": "msg_alias_shown"}
+    sent = _run_turn(cont, "msg_alias_next")
+    assert sent["thread"]["previous_message_id"] == "msg_alias_last"
+    assert sent["tools"] == recorded
+    other = {**HEADERS, "x-api-key": "other-key"}
+    sent_other = _run_turn(copy.deepcopy(cont), "msg_alias_other", headers=other)
+    assert sent_other["thread"]["previous_message_id"] == "msg_alias_shown", "scoped per caller"
+
+
 def test_failed_memory_continuation_keeps_the_original_id_and_forwarded_values(monkeypatch) -> None:  # noqa: ANN001
     _sticky(monkeypatch, inject=False)
     create = _continue_body([{"role": "user", "content": "x"}], tools=_tools_needing_compaction())

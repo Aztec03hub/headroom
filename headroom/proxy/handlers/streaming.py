@@ -21,7 +21,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
-from headroom.tool_name_registry import ThreadPinned, thread_pinned_of
+from headroom.tool_name_registry import ThreadPinned, record_thread_alias, thread_pinned_of
 from headroom.tool_name_registry import record_from_sse as _record_tool_names
 
 if TYPE_CHECKING:
@@ -511,8 +511,6 @@ class StreamingMixin:
         client tool still has its memory calls executed, but the turn goes back
         to the client, which cannot carry the memory results.
         """
-        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
-
         try:
             base_body = json.loads(outbound_bytes)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -521,6 +519,55 @@ class StreamingMixin:
         if not isinstance(messages, list):
             messages = None
         headers = {k: v for k, v in outbound_headers.items() if k.lower() != "content-length"}
+
+        # The client keeps round one's message id (its message_start is the only one
+        # forwarded); on a Thread turn the next continue must name the LAST round's.
+        shown_id = response.get("id") if isinstance(response, dict) else None
+        last_id = shown_id
+        try:
+            async for frame in self._memory_rounds(
+                memory_filter,
+                response,
+                base_body=base_body,
+                messages=messages,
+                headers=headers,
+                url=url,
+                memory_user_id=memory_user_id,
+                memory_request_ctx=memory_request_ctx,
+                server_memory_tool_names=server_memory_tool_names,
+                stream_state=stream_state,
+                request_id=request_id,
+                thread_scope=thread_scope,
+                thread_forwarded=thread_forwarded,
+            ):
+                if isinstance(frame, str):
+                    last_id = frame
+                else:
+                    yield frame
+        finally:
+            if thread_forwarded is not None and shown_id and last_id and last_id != shown_id:
+                record_thread_alias(thread_scope, shown_id, last_id)
+
+    async def _memory_rounds(
+        self,
+        memory_filter: MemoryToolStreamFilter,
+        response: dict[str, Any] | None,
+        *,
+        base_body: Any,
+        messages: list[Any] | None,
+        headers: dict[str, str],
+        url: str,
+        memory_user_id: str | None,
+        memory_request_ctx: Any | None,
+        server_memory_tool_names: frozenset[str],
+        stream_state: dict[str, Any],
+        request_id: str,
+        thread_scope: str,
+        thread_forwarded: ThreadPinned | None,
+    ) -> AsyncIterator[bytes | str]:
+        """The round loop of ``_continue_memory_tool_stream``: yields client frames, and
+        each continuation round's upstream message id (a ``str``) once it is parsed."""
+        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
         def is_memory_call(block: Any) -> bool:
             return (
@@ -655,6 +702,8 @@ class StreamingMixin:
                 else None
             )
             _add_round_usage(stream_state, response)
+            if isinstance(response, dict) and isinstance(response.get("id"), str):
+                yield response["id"]
             logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
 
     _MEMORY_CONTINUATION_MAX_ROUNDS = 4
@@ -1529,7 +1578,9 @@ class StreamingMixin:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
                     _sse_rest = b""
-                    _thread_forwarded = thread_pinned_of(body, thread_inherited)
+                    _thread_forwarded = thread_pinned_of(
+                        body, thread_inherited, server_memory_tool_names
+                    )
                     async for chunk in response.aiter_bytes():
                         sse_chunk_index += 1
                         if provider == "anthropic":

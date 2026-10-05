@@ -38,7 +38,9 @@ ThreadPinned = dict[str, bytes]
 
 
 def thread_pinned_of(
-    body: dict[str, Any], inherited: dict[str, Any] | None = None
+    body: dict[str, Any],
+    inherited: dict[str, Any] | None = None,
+    server_memory: frozenset[str] | None = None,
 ) -> ThreadPinned | None:
     """Canonical JSON of a Thread request body's system/tools, else None.
 
@@ -47,13 +49,18 @@ def thread_pinned_of(
     ``inherited``: the previous turn's record (``lookup_thread_pinned``). A continue
     turn that OMITS a key leaves the stored thread's value in place upstream, so that
     value is carried forward; a key the turn sends (even ``[]``) replaces it.
+    ``server_memory``: memory tools the proxy injected into the thread and runs itself;
+    recorded when non-empty, else inherited, so a later turn that omits ``tools`` still
+    withholds and runs their calls.
     """
     if not isinstance(body.get("thread"), dict):
         return None
     src = {**(inherited or {}), **{k: body[k] for k in ("system", "tools") if k in body}}
+    if server_memory:
+        src["server_memory"] = sorted(server_memory)
     return {
         k: json.dumps(src[k], separators=(",", ":"), ensure_ascii=False).encode()
-        for k in ("system", "tools")
+        for k in ("system", "tools", "server_memory")
         if k in src
     }
 
@@ -91,6 +98,32 @@ def lookup_thread_pinned(scope: str, message_id: object) -> dict[str, Any] | Non
         refs = _thread_pinned.get((scope, message_id))
         blobs = {k: _blobs[(scope, sha)] for k, sha in refs.items()} if refs is not None else None
     return None if blobs is None else {k: json.loads(v) for k, v in blobs.items()}
+
+
+_aliases: OrderedDict[tuple[str, str], str] = OrderedDict()
+
+
+def record_thread_alias(scope: str, shown_id: str, final_id: str) -> None:
+    """The client saw ``shown_id`` but the thread's latest message is ``final_id``.
+
+    A streamed turn that ran server-side memory rounds announced round one's id in its
+    message_start, and that cannot be changed once sent; the client continues from it.
+    """
+    with _lock:
+        _aliases[(scope, shown_id)] = final_id
+        _aliases.move_to_end((scope, shown_id))
+        while len(_aliases) > _THREAD_MAX:
+            _aliases.popitem(last=False)
+
+
+def resolve_thread_alias(scope: str, message_id: object) -> object:
+    """The thread's real latest message id for a client-visible one (else unchanged)."""
+    with _lock:
+        for _ in range(8):  # chained aliases (one per streamed memory turn); bounded
+            if not isinstance(message_id, str) or (scope, message_id) not in _aliases:
+                break
+            message_id = _aliases[(scope, message_id)]
+    return message_id
 
 
 def record(scope: str, tool_use_id: str, name: str) -> None:

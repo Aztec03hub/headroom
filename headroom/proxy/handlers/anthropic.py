@@ -79,6 +79,7 @@ from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_toke
 from headroom.tool_name_registry import (
     lookup_thread_pinned,
     record_thread_pinned,
+    resolve_thread_alias,
     thread_pinned_of,
 )
 from headroom.tool_name_registry import record_from_json as _record_tool_names_json
@@ -1142,9 +1143,14 @@ class AnthropicHandlerMixin:
             # for each key the client carries (a key the client omits stays omitted).
             _thread_recorded = None
             if _thread_pinned is not None:
-                _thread_recorded = lookup_thread_pinned(
-                    _tool_scope, body["thread"].get("previous_message_id")
-                )
+                # A streamed turn with server-side memory rounds showed the client round
+                # one's id; the thread continues from the last round's message.
+                _prev_id = body["thread"].get("previous_message_id")
+                _real_prev = resolve_thread_alias(_tool_scope, _prev_id)
+                if _real_prev != _prev_id:
+                    body["thread"] = {**body["thread"], "previous_message_id": _real_prev}
+                    body_mutation_tracker.mark_mutated("thread_memory_round_alias")
+                _thread_recorded = lookup_thread_pinned(_tool_scope, _real_prev)
                 if _thread_recorded is not None:
                     for _k in list(_thread_pinned):
                         if _k in _thread_recorded:
@@ -1459,7 +1465,8 @@ class AnthropicHandlerMixin:
                 "output_config": body.get("output_config"),
                 # Thread continue bodies are tiny deltas; without the thread
                 # two conversations sending the same delta would share a key.
-                "thread": body.get("thread"),
+                # Only when present: every non-thread key stays what it was.
+                **({"thread": body["thread"]} if "thread" in body else {}),
             }
             # Snapshot the lookup messages too. `messages` is the primary cache
             # key component, but it is reassigned below by the security scan, the
@@ -2622,7 +2629,11 @@ class AnthropicHandlerMixin:
             # A Thread continue turn without tools must forward no tools: the API
             # 400s on any change to the stored thread's tools, so skip all injection.
             _thread_continue_turn = is_thread_continue(body)
-            _thread_no_tools = _thread_continue_turn and not body.get("tools")
+            # Judged on the tools actually forwarded (the pin), not the client's: a continue
+            # whose previous turn was never recorded (restart, eviction, a token refresh
+            # changes the scope) drops resent tools, and injection/repair must not then
+            # run against tools that will not be sent.
+            _thread_no_tools = _thread_continue_turn and not (_thread_pinned or {}).get("tools")
             # No recorded forwarded tools for the previous turn (e.g. proxy restart): the
             # client's tools are restored and the sticky retrieve tool is kept only if
             # the history already references it. The API's exact rule for a continue
@@ -2985,6 +2996,11 @@ class AnthropicHandlerMixin:
                         inject_this_turn=bool(self.memory_handler.config.inject_tools),
                         client_declared_tools=bool(_original_tools),
                     )
+                _thread_mem = (_thread_recorded or {}).get("server_memory")
+                if _thread_continue_turn and _thread_mem:
+                    # The stored thread holds memory tools the proxy injected on an earlier
+                    # turn: their calls stay the proxy's even when this turn omits tools.
+                    server_memory_tool_names = frozenset(_thread_mem)
                 if mem_tools_injected:
                     memory_tools_injected = True
                     server_memory_tool_names = self._server_memory_tool_names(
@@ -4508,7 +4524,9 @@ class AnthropicHandlerMixin:
                         resp_json = None
                         # system/tools of the LAST upstream call whose reply the client
                         # receives (CCR/memory/hook continuations update this).
-                        _final_pinned = thread_pinned_of(body, _thread_recorded)
+                        _final_pinned = thread_pinned_of(
+                            body, _thread_recorded, server_memory_tool_names
+                        )
                         try:
                             resp_json = response.json()
                             _record_tool_names_json(_tool_scope, resp_json)
@@ -4642,7 +4660,9 @@ class AnthropicHandlerMixin:
                                     # produces the reply the client receives; a failed
                                     # one leaves the original id and its own values.
                                     _final_pinned = thread_pinned_of(
-                                        continuation_body, _thread_recorded
+                                        continuation_body,
+                                        _thread_recorded,
+                                        server_memory_tool_names,
                                     )
                                     return result
                                 except Exception as e:
@@ -4806,7 +4826,9 @@ class AnthropicHandlerMixin:
                                     resp_json = cont_response.json()
                                     response = cont_response
                                     _final_pinned = thread_pinned_of(
-                                        continuation_body, _thread_recorded
+                                        continuation_body,
+                                        _thread_recorded,
+                                        server_memory_tool_names,
                                     )
                                     logger.info(
                                         f"[{request_id}] Memory: Tool calls handled, continuation complete"
