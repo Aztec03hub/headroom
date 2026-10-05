@@ -522,18 +522,21 @@ impl SearchCompressor {
             // Sort by score desc, ties broken by line number asc for
             // determinism (Python's `sorted` is stable; order in is
             // line-asc by construction so highest-score-first picks the
-            // earliest line on ties).
-            let mut sorted = fm.matches.clone();
-            sorted.sort_by(|a, b| {
+            // earliest line on ties). Rows are handled by input index so
+            // the output emits exactly the occurrence that was selected.
+            let mut sorted: Vec<usize> = (0..fm.matches.len()).collect();
+            sorted.sort_by(|&a, &b| {
+                let (a, b) = (&fm.matches[a], &fm.matches[b]);
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.line_number.cmp(&b.line_number))
             });
 
-            let mut file_selected: Vec<SearchMatch> = Vec::new();
-            // BTreeSet for O(log n) "already in selection" check (Python
-            // uses linear `not in` — quadratic for big files).
+            // Selected input indices, plus the (line, content) keys already
+            // taken: a row repeating a selected row's number and content is
+            // still skipped (BTreeSet: O(log n), Python uses linear `not in`).
+            let mut picked: BTreeSet<usize> = BTreeSet::new();
             let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
 
             let remaining_cap = self
@@ -541,51 +544,36 @@ impl SearchCompressor {
                 .max_matches_per_file
                 .min(adaptive_total.saturating_sub(total_selected));
 
-            let push_unique = |m: &SearchMatch,
-                               file_selected: &mut Vec<SearchMatch>,
-                               seen: &mut BTreeSet<(u64, u64)>| {
-                let key = (m.line_number, hash_u64(&m.content));
-                if seen.insert(key) {
-                    file_selected.push(m.clone());
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if self.config.always_keep_first {
-                if let Some(first) = fm.first() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(first, &mut file_selected, &mut seen);
+            let push_unique =
+                |i: usize, picked: &mut BTreeSet<usize>, seen: &mut BTreeSet<(u64, u64)>| {
+                    let m = &fm.matches[i];
+                    if seen.insert((m.line_number, hash_u64(&m.content))) {
+                        picked.insert(i);
                     }
-                }
+                };
+
+            let n = fm.matches.len();
+            if self.config.always_keep_first && n > 0 && picked.len() < remaining_cap {
+                push_unique(0, &mut picked, &mut seen);
             }
 
-            if self.config.always_keep_last && fm.matches.len() > 1 {
-                if let Some(last) = fm.last() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(last, &mut file_selected, &mut seen);
-                    }
-                }
+            if self.config.always_keep_last && n > 1 && picked.len() < remaining_cap {
+                push_unique(n - 1, &mut picked, &mut seen);
             }
 
-            for m in &sorted {
-                if file_selected.len() >= remaining_cap {
+            for &i in &sorted {
+                if picked.len() >= remaining_cap {
                     break;
                 }
-                push_unique(m, &mut file_selected, &mut seen);
+                push_unique(i, &mut picked, &mut seen);
             }
 
             // Restore INPUT order for output (grep emits line order, so this is
             // line order for real grep). Sorting by line number alone put the
             // forced first/last rows ahead of any rows sharing their number,
             // e.g. `api:12:00:03 ...` log rows whose "line" is the hour.
-            let file_selected: Vec<SearchMatch> = fm
-                .matches
-                .iter()
-                .filter(|m| seen.remove(&(m.line_number, hash_u64(&m.content))))
-                .cloned()
-                .collect();
+            let file_selected: Vec<SearchMatch> =
+                picked.iter().map(|&i| fm.matches[i].clone()).collect();
 
             let dropped_here = fm.matches.len().saturating_sub(file_selected.len());
             stats.matches_dropped_by_per_file_cap += dropped_here;
@@ -1367,6 +1355,29 @@ logs/2026-05-04/app.log:7:ERROR bang";
         assert!(parse_line("src/file.py:-1:invalid").is_none());
         // Equivalent form with the dash adjacent to the dash separator.
         assert!(parse_line("src/file.py--1-invalid").is_none());
+    }
+
+    #[test]
+    fn the_selected_occurrence_is_emitted_not_its_twin() {
+        // A match row and a context row sharing number and content: keeping
+        // only the last row must emit the context row, not the match.
+        let c = SearchCompressor::new(SearchCompressorConfig {
+            always_keep_first: false,
+            always_keep_last: true,
+            max_matches_per_file: 1,
+            ..SearchCompressorConfig::default()
+        });
+        let mut stats = SearchCompressorStats::default();
+        let files = c.parse_search_results("a.py:12:x\na.py-12-x\n", &mut stats);
+        let mut files = files;
+        for fm in files.values_mut() {
+            for m in &mut fm.matches {
+                m.score = 0.5;
+            }
+        }
+        let picked = c.select_matches(&files, 1.0, &mut stats);
+        let rows: Vec<String> = picked["a.py"].matches.iter().map(|m| m.render()).collect();
+        assert_eq!(rows, vec!["a.py-12-x".to_string()]);
     }
 
     #[test]
