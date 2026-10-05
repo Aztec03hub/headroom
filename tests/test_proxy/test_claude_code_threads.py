@@ -870,7 +870,7 @@ class _FakeMemory:
 DIVERGED = [{"name": "diverged", "description": "d", "input_schema": {"type": "object"}}]
 
 
-def _memory_turn(monkeypatch, body: dict, fail: bool) -> tuple[dict, dict]:  # noqa: ANN001
+def _memory_turn(monkeypatch, body: dict, fail: bool, final_content=None) -> tuple[dict, dict]:  # noqa: ANN001
     """POST ``body`` with a fake memory handler whose continuation succeeds or raises.
 
     The handler keeps ``tools`` (a local) in step with ``body["tools"]`` everywhere, so
@@ -904,7 +904,10 @@ def _memory_turn(monkeypatch, body: dict, fail: bool) -> tuple[dict, dict]:  # n
                 return await first(method, url, headers, body, stream=stream, **kwargs)
             if fail:
                 raise httpx.ConnectError("boom")
-            return _response("msg_mem_final")
+            final = _response("msg_mem_final")
+            if final_content is not None:
+                final = httpx.Response(200, json={**final.json(), "content": final_content})
+            return final
 
         proxy._retry_request = _retry
         proxy.memory_handler = _FakeMemory()
@@ -940,6 +943,61 @@ def test_memory_continuation_on_a_create_turn_records_the_continuation_it_sent(m
     assert out["id"] == "msg_mem_final"
     assert out["sent"][0]["tools"] == DIVERGED and out["sent"][1]["tools"] != DIVERGED
     assert recorded["msg_mem_final"]["tools"] == out["sent"][1]["tools"]
+
+
+def test_memory_continuation_reply_tool_names_are_recorded(monkeypatch) -> None:  # noqa: ANN001
+    """The client runs the tool the CONTINUATION reply called, then answers it on a
+    continue turn whose tool_use lives upstream: that name must be learned."""
+    create = _continue_body([{"role": "user", "content": "x"}], tools=_tools_needing_compaction())
+    create["thread"] = {"type": "create"}
+    final = [{"type": "tool_use", "id": "toolu_after_mem", "name": "Read", "input": {}}]
+    out, _ = _memory_turn(monkeypatch, create, fail=False, final_content=final)
+    assert out["id"] == "msg_mem_final"
+    assert tool_name_registry.lookup(S, "toolu_after_mem") == "Read"
+
+
+def test_registry_inherits_pins_a_continue_turn_omits_but_not_ones_it_sends() -> None:
+    prev = {"system": [{"type": "text", "text": "s"}], "tools": [{"name": "mcp__x__y"}]}
+    omits = tool_name_registry.thread_pinned_of({"thread": CONTINUE, "system": "b"}, prev)
+    assert json.loads(omits["tools"]) == prev["tools"] and json.loads(omits["system"]) == "b"
+    empty = tool_name_registry.thread_pinned_of({"thread": CONTINUE, "tools": []}, prev)
+    assert json.loads(empty["tools"]) == [], "an explicit empty list replaces, never inherits"
+    assert tool_name_registry.thread_pinned_of({"thread": CONTINUE}, None) == {}
+
+
+def test_tools_omitted_mid_thread_stay_pinned_when_resent_with_a_reference(monkeypatch) -> None:  # noqa: ANN001
+    """create(tools) -> continue(no tools) -> continue(tools + tool_reference): the stored
+    thread still has the tools, so the resent ones are kept and the reference survives
+    (reviewer repro on #3897: the middle record held only `system`, the tools were
+    stripped and the reference was 'repaired' away)."""
+    _sticky(monkeypatch, inject=False)
+    tools = [{"name": "mcp__x__y", "description": "d", "input_schema": {"type": "object"}}]
+    create = _continue_body([{"role": "user", "content": "x"}], tools=copy.deepcopy(tools))
+    create["thread"] = {"type": "create"}
+    forwarded_create = _run_turn(create, "msg_inh_1")
+
+    middle = _continue_body([{"role": "user", "content": "y"}])
+    middle["thread"] = {"type": "continue", "previous_message_id": "msg_inh_1"}
+    assert "tools" not in _run_turn(middle, "msg_inh_2")
+
+    ref = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_inh",
+                    "content": [{"type": "tool_reference", "tool_name": "mcp__x__y"}],
+                }
+            ],
+        }
+    ]
+    last = _continue_body(ref, tools=copy.deepcopy(tools))
+    last["thread"] = {"type": "continue", "previous_message_id": "msg_inh_2"}
+    sent = _run_turn(last, "msg_inh_3")
+    assert json.dumps(sent["tools"]) == json.dumps(forwarded_create["tools"])
+    assert "tool_reference" in json.dumps(sent["messages"])
+    assert "no longer available" not in json.dumps(sent["messages"])
 
 
 def test_failed_memory_continuation_keeps_the_original_id_and_forwarded_values(monkeypatch) -> None:  # noqa: ANN001

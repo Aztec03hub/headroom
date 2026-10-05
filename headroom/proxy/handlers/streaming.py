@@ -21,8 +21,8 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.tool_name_registry import ThreadPinned, thread_pinned_of
 from headroom.tool_name_registry import record_from_sse as _record_tool_names
-from headroom.tool_name_registry import thread_pinned_of
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -498,6 +498,8 @@ class StreamingMixin:
         server_memory_tool_names: frozenset[str],
         stream_state: dict[str, Any],
         request_id: str,
+        thread_scope: str = "",
+        thread_forwarded: ThreadPinned | None = None,
     ) -> AsyncIterator[bytes]:
         """Execute withheld memory tool calls and stream continuation rounds.
 
@@ -632,7 +634,11 @@ class StreamingMixin:
                 # Same cap as the first round's buffer; past it the round is
                 # still streamed, just not rebuilt for a further continuation.
                 round_bytes: bytearray | None = bytearray()
+                sse_rest = b""
                 async for chunk in upstream.aiter_bytes():
+                    # A client tool called in a later round is run by the client and
+                    # answered on a Thread continue turn: learn its name here too.
+                    sse_rest = _record_tool_names(thread_scope, sse_rest + chunk, thread_forwarded)
                     if round_bytes is not None:
                         round_bytes.extend(chunk)
                         if len(round_bytes) > MAX_SSE_BUFFER_SIZE:
@@ -1031,6 +1037,7 @@ class StreamingMixin:
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         thread_scope: str = "",
+        thread_inherited: dict[str, Any] | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
@@ -1078,6 +1085,7 @@ class StreamingMixin:
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
                 thread_scope=thread_scope,
+                thread_inherited=thread_inherited,
                 server_memory_tool_names=server_memory_tool_names,
             )
         except (Exception, asyncio.CancelledError):
@@ -1112,6 +1120,7 @@ class StreamingMixin:
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         thread_scope: str = "",
+        thread_inherited: dict[str, Any] | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
@@ -1520,7 +1529,7 @@ class StreamingMixin:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
                     _sse_rest = b""
-                    _thread_forwarded = thread_pinned_of(body)
+                    _thread_forwarded = thread_pinned_of(body, thread_inherited)
                     async for chunk in response.aiter_bytes():
                         sse_chunk_index += 1
                         if provider == "anthropic":
@@ -1656,6 +1665,8 @@ class StreamingMixin:
                             server_memory_tool_names=server_memory_tool_names or frozenset(),
                             stream_state=stream_state,
                             request_id=request_id,
+                            thread_scope=thread_scope,
+                            thread_forwarded=_thread_forwarded,
                         ):
                             yield frame
                         memory_filter = None
@@ -1699,6 +1710,8 @@ class StreamingMixin:
                         server_memory_tool_names=server_memory_tool_names or frozenset(),
                         stream_state=stream_state,
                         request_id=request_id,
+                        thread_scope=thread_scope,
+                        thread_forwarded=_thread_forwarded,
                     ):
                         yield frame
 

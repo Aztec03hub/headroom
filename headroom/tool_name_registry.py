@@ -37,18 +37,24 @@ _blob_refs: dict[tuple[str, str], int] = {}
 ThreadPinned = dict[str, bytes]
 
 
-def thread_pinned_of(body: dict[str, Any]) -> ThreadPinned | None:
+def thread_pinned_of(
+    body: dict[str, Any], inherited: dict[str, Any] | None = None
+) -> ThreadPinned | None:
     """Canonical JSON of a Thread request body's system/tools, else None.
 
     Order-preserving (the bytes must round-trip to the same wire order); bytes are
     immutable, so later mutation of ``body`` cannot change what is recorded.
+    ``inherited``: the previous turn's record (``lookup_thread_pinned``). A continue
+    turn that OMITS a key leaves the stored thread's value in place upstream, so that
+    value is carried forward; a key the turn sends (even ``[]``) replaces it.
     """
     if not isinstance(body.get("thread"), dict):
         return None
+    src = {**(inherited or {}), **{k: body[k] for k in ("system", "tools") if k in body}}
     return {
-        k: json.dumps(body[k], separators=(",", ":"), ensure_ascii=False).encode()
+        k: json.dumps(src[k], separators=(",", ":"), ensure_ascii=False).encode()
         for k in ("system", "tools")
-        if k in body
+        if k in src
     }
 
 

@@ -298,6 +298,25 @@ class TestStreamingMemoryContinuation:
         assert events == _events(raw)
 
 
+class TestThreadToolNamesAcrossRounds:
+    @pytest.mark.asyncio
+    async def test_client_tool_called_in_a_continuation_round_is_named_for_the_thread(
+        self,
+    ) -> None:
+        """A Bash call made after a server-side memory round is answered on a Thread
+        continue turn whose tool_use lives upstream: its name must be recorded too."""
+        from headroom import tool_name_registry
+
+        bash2 = {**BASH, "id": "toolu_bash_round2"}
+        proxy = _proxy(
+            [_sse([TEXT, SAVE], "tool_use"), _sse([bash2], "tool_use")],
+            SAVE_RESULT,
+        )
+        await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS, thread_scope="scope-r2")
+        assert tool_name_registry.lookup("scope-r2", "toolu_mem") == "memory_save"
+        assert tool_name_registry.lookup("scope-r2", "toolu_bash_round2") == "Bash"
+
+
 class TestRecordedMemoryCalls:
     def test_hidden_call_input_is_rebuilt_from_stream(self) -> None:
         flt = MemoryToolStreamFilter(MEMORY_TOOLS)

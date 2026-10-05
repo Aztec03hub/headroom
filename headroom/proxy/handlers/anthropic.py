@@ -4249,6 +4249,7 @@ class AnthropicHandlerMixin:
                         outcome_provider=provider_name,
                         session_key=session_key,
                         thread_scope=_tool_scope,
+                        thread_inherited=_thread_recorded,
                         server_memory_tool_names=server_memory_tool_names,
                     )
                 else:
@@ -4507,7 +4508,7 @@ class AnthropicHandlerMixin:
                         resp_json = None
                         # system/tools of the LAST upstream call whose reply the client
                         # receives (CCR/memory/hook continuations update this).
-                        _final_pinned = thread_pinned_of(body)
+                        _final_pinned = thread_pinned_of(body, _thread_recorded)
                         try:
                             resp_json = response.json()
                             _record_tool_names_json(_tool_scope, resp_json)
@@ -4640,7 +4641,9 @@ class AnthropicHandlerMixin:
                                     # Only a continuation that succeeded and parsed
                                     # produces the reply the client receives; a failed
                                     # one leaves the original id and its own values.
-                                    _final_pinned = thread_pinned_of(continuation_body)
+                                    _final_pinned = thread_pinned_of(
+                                        continuation_body, _thread_recorded
+                                    )
                                     return result
                                 except Exception as e:
                                     resp_headers: str | dict[str, str] = "N/A"
@@ -4802,7 +4805,9 @@ class AnthropicHandlerMixin:
                                     # Update response with continuation
                                     resp_json = cont_response.json()
                                     response = cont_response
-                                    _final_pinned = thread_pinned_of(continuation_body)
+                                    _final_pinned = thread_pinned_of(
+                                        continuation_body, _thread_recorded
+                                    )
                                     logger.info(
                                         f"[{request_id}] Memory: Tool calls handled, continuation complete"
                                     )
@@ -4855,7 +4860,11 @@ class AnthropicHandlerMixin:
                                 )
 
                         # Record by the id the client actually receives, with the
-                        # system/tools of the call that produced it.
+                        # system/tools of the call that produced it; and the tool names
+                        # of that final reply (a memory/CCR/hook continuation replaced
+                        # the first one, whose names were recorded above).
+                        if resp_json and response.status_code == 200:
+                            _record_tool_names_json(_tool_scope, resp_json)
                         if (
                             _final_pinned is not None
                             and resp_json
