@@ -361,6 +361,80 @@ class TestThreadMemoryRounds:
         assert tool_name_registry.resolve_thread_alias("other-scope", "msg_1") == "msg_1"
         assert tool_name_registry.lookup("scope-alias", "toolu_round2") == "Bash"
 
+    async def _thread_stream(self, proxy: HeadroomProxy, scope: str, **kwargs: Any) -> list:
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-test",
+                "max_tokens": 100,
+                "stream": True,
+                "thread": {"type": "continue", "previous_message_id": "msg_p"},
+                "messages": [{"role": "user", "content": "remember the deploy region"}],
+            },
+            provider="anthropic",
+            model="claude-test",
+            request_id="test-mem-thread",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+            server_memory_tool_names=MEMORY_TOOLS,
+            thread_scope=scope,
+            **kwargs,
+        )
+        return _events(b"".join([chunk async for chunk in result.body_iterator]))
+
+    @pytest.mark.asyncio
+    async def test_a_round_too_big_to_rebuild_still_gets_its_alias(self, monkeypatch) -> None:  # noqa: ANN001
+        from headroom import tool_name_registry
+
+        monkeypatch.setattr("headroom.proxy.helpers.MAX_SSE_BUFFER_SIZE", 4000)
+        big = {"type": "text", "text": "x" * 6000}
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([big], "end_turn").replace(b'"msg_1"', b'"msg_big2"'),
+            ],
+            SAVE_RESULT,
+        )
+        await self._thread_stream(proxy, "scope-big", memory_user_id="user-1")
+        assert tool_name_registry.resolve_thread_alias("scope-big", "msg_1") == "msg_big2"
+
+    @pytest.mark.asyncio
+    async def test_memory_results_not_sent_back_are_kept_for_the_next_continue(self) -> None:
+        """A round that also calls a client tool returns the turn to the client; upstream
+        stores the memory tool_use unanswered, so its result must ride the next turn."""
+        from headroom import tool_name_registry
+
+        save2 = {**SAVE, "id": "toolu_mem2"}
+        bash2 = {**BASH, "id": "toolu_bash2"}
+        result2 = [{"type": "tool_result", "tool_use_id": "toolu_mem2", "content": "saved"}]
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([save2, bash2], "tool_use").replace(b'"msg_1"', b'"msg_mixed2"'),
+            ],
+            SAVE_RESULT,
+        )
+        proxy.memory_handler.handle_memory_tool_calls = AsyncMock(
+            side_effect=[SAVE_RESULT, result2]
+        )
+        await self._thread_stream(proxy, "scope-pend", memory_user_id="user-1")
+        assert tool_name_registry.resolve_thread_alias("scope-pend", "msg_1") == "msg_mixed2"
+        assert tool_name_registry.pop_pending_results("scope-pend", "msg_mixed2") == result2
+
+    @pytest.mark.asyncio
+    async def test_memory_calls_without_a_result_get_an_error_result_on_a_thread(self) -> None:
+        from headroom import tool_name_registry
+
+        proxy = _proxy([_sse([SAVE, BASH], "tool_use")], [])  # the memory backend returned nothing
+        await self._thread_stream(proxy, "scope-nouser", memory_user_id="user-1")
+        pending = tool_name_registry.pop_pending_results("scope-nouser", "msg_1")
+        assert [(r["tool_use_id"], r.get("is_error")) for r in pending] == [("toolu_mem", True)]
+
     @pytest.mark.asyncio
     async def test_no_alias_without_a_thread(self) -> None:
         from headroom import tool_name_registry

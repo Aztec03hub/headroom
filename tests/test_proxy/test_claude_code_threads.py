@@ -1064,6 +1064,21 @@ def test_continue_from_a_streamed_memory_turn_follows_the_alias(monkeypatch) -> 
     assert sent_other["thread"]["previous_message_id"] == "msg_alias_shown", "scoped per caller"
 
 
+def test_next_continue_carries_memory_results_the_thread_still_needs(monkeypatch) -> None:  # noqa: ANN001
+    _sticky(monkeypatch, inject=False)
+    pending = [{"type": "tool_result", "tool_use_id": "toolu_mem_p", "content": "saved"}]
+    tool_name_registry.record_pending_results(S, "msg_pend_prev", pending)
+    client_result = {"type": "tool_result", "tool_use_id": "toolu_bash_p", "content": "ok"}
+    cont = _continue_body([{"role": "user", "content": [client_result]}])
+    cont["thread"] = {"type": "continue", "previous_message_id": "msg_pend_prev"}
+    sent = _run_turn(cont, "msg_pend_next")
+    ids = [b.get("tool_use_id") for b in sent["messages"][0]["content"]]
+    assert ids == ["toolu_mem_p", "toolu_bash_p"], "the pending result first, then the client's"
+    again = _continue_body([{"role": "user", "content": "next"}])
+    again["thread"] = {"type": "continue", "previous_message_id": "msg_pend_prev"}
+    assert "toolu_mem_p" not in json.dumps(_run_turn(again, "msg_pend_again")), "used once"
+
+
 def test_failed_memory_continuation_keeps_the_original_id_and_forwarded_values(monkeypatch) -> None:  # noqa: ANN001
     _sticky(monkeypatch, inject=False)
     create = _continue_body([{"role": "user", "content": "x"}], tools=_tools_needing_compaction())

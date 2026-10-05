@@ -126,6 +126,45 @@ def resolve_thread_alias(scope: str, message_id: object) -> object:
     return message_id
 
 
+_pending: OrderedDict[tuple[str, str], list[dict[str, Any]]] = OrderedDict()
+
+
+def record_pending_results(scope: str, message_id: str, results: list[dict[str, Any]]) -> None:
+    """tool_result blocks the stored thread still needs for message ``message_id``.
+
+    A streamed turn that ended with proxy memory calls run but not sent back (a round
+    that also called a client tool, the round cap, no memory user) leaves upstream with
+    an unanswered tool_use; the next continue must carry these results.
+    """
+    with _lock:
+        _pending[(scope, message_id)] = list(results)
+        _pending.move_to_end((scope, message_id))
+        while len(_pending) > _THREAD_MAX:
+            _pending.popitem(last=False)
+
+
+def pop_pending_results(scope: str, message_id: object) -> list[dict[str, Any]]:
+    if not isinstance(message_id, str):
+        return []
+    with _lock:
+        return _pending.pop((scope, message_id), [])
+
+
+def message_id_from_sse(data: bytes) -> tuple[str | None, bytes]:
+    """The id in a ``message_start`` event among complete SSE lines; the partial tail."""
+    *lines, rest = data.split(b"\n")
+    for line in lines:
+        if line.startswith(b"data:") and b"message_start" in line:
+            try:
+                ev = json.loads(line[5:])
+            except ValueError:
+                continue
+            msg = ev.get("message") if isinstance(ev, dict) else None
+            if isinstance(msg, dict) and isinstance(msg.get("id"), str):
+                return msg["id"], b""
+    return None, rest[-65536:]
+
+
 def record(scope: str, tool_use_id: str, name: str) -> None:
     with _lock:
         _names[(scope, tool_use_id)] = name

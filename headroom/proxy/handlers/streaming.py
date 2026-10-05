@@ -21,7 +21,13 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
-from headroom.tool_name_registry import ThreadPinned, record_thread_alias, thread_pinned_of
+from headroom.tool_name_registry import (
+    ThreadPinned,
+    message_id_from_sse,
+    record_pending_results,
+    record_thread_alias,
+    thread_pinned_of,
+)
 from headroom.tool_name_registry import record_from_sse as _record_tool_names
 
 if TYPE_CHECKING:
@@ -524,29 +530,37 @@ class StreamingMixin:
         # forwarded); on a Thread turn the next continue must name the LAST round's.
         shown_id = response.get("id") if isinstance(response, dict) else None
         last_id = shown_id
+        pending: list[dict[str, Any]] = []
+        rounds = self._memory_rounds(
+            memory_filter,
+            response,
+            base_body=base_body,
+            messages=messages,
+            headers=headers,
+            url=url,
+            memory_user_id=memory_user_id,
+            memory_request_ctx=memory_request_ctx,
+            server_memory_tool_names=server_memory_tool_names,
+            stream_state=stream_state,
+            request_id=request_id,
+            thread_scope=thread_scope,
+            thread_forwarded=thread_forwarded,
+        )
         try:
-            async for frame in self._memory_rounds(
-                memory_filter,
-                response,
-                base_body=base_body,
-                messages=messages,
-                headers=headers,
-                url=url,
-                memory_user_id=memory_user_id,
-                memory_request_ctx=memory_request_ctx,
-                server_memory_tool_names=server_memory_tool_names,
-                stream_state=stream_state,
-                request_id=request_id,
-                thread_scope=thread_scope,
-                thread_forwarded=thread_forwarded,
-            ):
-                if isinstance(frame, str):
-                    last_id = frame
-                else:
-                    yield frame
+            async with contextlib.aclosing(rounds):
+                async for frame in rounds:
+                    if isinstance(frame, str):
+                        last_id = frame
+                    elif isinstance(frame, list):
+                        pending = frame
+                    else:
+                        yield frame
         finally:
-            if thread_forwarded is not None and shown_id and last_id and last_id != shown_id:
-                record_thread_alias(thread_scope, shown_id, last_id)
+            if thread_forwarded is not None:
+                if shown_id and last_id and last_id != shown_id:
+                    record_thread_alias(thread_scope, shown_id, last_id)
+                if pending and last_id:
+                    record_pending_results(thread_scope, last_id, pending)
 
     async def _memory_rounds(
         self,
@@ -564,9 +578,11 @@ class StreamingMixin:
         request_id: str,
         thread_scope: str,
         thread_forwarded: ThreadPinned | None,
-    ) -> AsyncIterator[bytes | str]:
-        """The round loop of ``_continue_memory_tool_stream``: yields client frames, and
-        each continuation round's upstream message id (a ``str``) once it is parsed."""
+    ) -> AsyncIterator[bytes | str | list[dict[str, Any]]]:
+        """The round loop of ``_continue_memory_tool_stream``: yields client frames, each
+        continuation round's upstream message id (a ``str``, from its message_start), and
+        on a Thread turn that ends with proxy memory calls not sent back, their
+        tool_result blocks (a ``list``) for the next continue to carry."""
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
         def is_memory_call(block: Any) -> bool:
@@ -627,6 +643,20 @@ class StreamingMixin:
                 and rounds < self._MEMORY_CONTINUATION_MAX_ROUNDS
             )
             if not can_continue:
+                if thread_forwarded is not None and memory_calls:
+                    # Upstream stores this round's memory tool_use; answer every call.
+                    done = {r.get("tool_use_id"): r for r in tool_results if isinstance(r, dict)}
+                    yield [
+                        done.get(c.get("id"))
+                        or {
+                            "type": "tool_result",
+                            "tool_use_id": c.get("id"),
+                            "content": "Memory tool result unavailable.",
+                            "is_error": True,
+                        }
+                        for c in memory_calls
+                        if isinstance(c, dict) and isinstance(c.get("id"), str)
+                    ]
                 if memory_filter.visible_tool_use:
                     logger.info(
                         f"[{request_id}] Memory: Round also called a client tool; "
@@ -682,7 +712,14 @@ class StreamingMixin:
                 # still streamed, just not rebuilt for a further continuation.
                 round_bytes: bytearray | None = bytearray()
                 sse_rest = b""
+                round_id: str | None = None
+                id_rest = b""
                 async for chunk in upstream.aiter_bytes():
+                    if round_id is None:  # from message_start: known even when the
+                        # round is too big to rebuild
+                        round_id, id_rest = message_id_from_sse(id_rest + chunk)
+                        if round_id is not None:
+                            yield round_id
                     # A client tool called in a later round is run by the client and
                     # answered on a Thread continue turn: learn its name here too.
                     sse_rest = _record_tool_names(thread_scope, sse_rest + chunk, thread_forwarded)
@@ -702,8 +739,6 @@ class StreamingMixin:
                 else None
             )
             _add_round_usage(stream_state, response)
-            if isinstance(response, dict) and isinstance(response.get("id"), str):
-                yield response["id"]
             logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
 
     _MEMORY_CONTINUATION_MAX_ROUNDS = 4
