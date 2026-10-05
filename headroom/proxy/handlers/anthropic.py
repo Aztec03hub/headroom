@@ -78,7 +78,7 @@ from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.tool_name_registry import (
     lookup_thread_pinned,
-    pop_pending_results,
+    pending_results,
     record_thread_pinned,
     resolve_thread_alias,
     thread_pinned_of,
@@ -1154,7 +1154,7 @@ class AnthropicHandlerMixin:
                 _thread_recorded = lookup_thread_pinned(_tool_scope, _real_prev)
                 # Results for proxy memory calls that message holds unanswered upstream
                 # (a streamed turn that ended without sending them back).
-                _pending = pop_pending_results(_tool_scope, _real_prev)
+                _pending = pending_results(_tool_scope, _real_prev)
                 if _pending:
                     _msgs = list(body.get("messages") or [])
                     if _msgs and isinstance(_msgs[0], dict) and _msgs[0].get("role") == "user":

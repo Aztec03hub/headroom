@@ -1076,7 +1076,10 @@ def test_next_continue_carries_memory_results_the_thread_still_needs(monkeypatch
     assert ids == ["toolu_mem_p", "toolu_bash_p"], "the pending result first, then the client's"
     again = _continue_body([{"role": "user", "content": "next"}])
     again["thread"] = {"type": "continue", "previous_message_id": "msg_pend_prev"}
-    assert "toolu_mem_p" not in json.dumps(_run_turn(again, "msg_pend_again")), "used once"
+    retried = _run_turn(again, "msg_pend_again")
+    assert retried["messages"][0]["content"][0]["tool_use_id"] == "toolu_mem_p", (
+        "kept: a retry or another continue from that message needs the same answers"
+    )
 
 
 def test_failed_memory_continuation_keeps_the_original_id_and_forwarded_values(monkeypatch) -> None:  # noqa: ANN001

@@ -506,6 +506,7 @@ class StreamingMixin:
         request_id: str,
         thread_scope: str = "",
         thread_forwarded: ThreadPinned | None = None,
+        first_message_id: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Execute withheld memory tool calls and stream continuation rounds.
 
@@ -528,7 +529,7 @@ class StreamingMixin:
 
         # The client keeps round one's message id (its message_start is the only one
         # forwarded); on a Thread turn the next continue must name the LAST round's.
-        shown_id = response.get("id") if isinstance(response, dict) else None
+        shown_id = response.get("id") if isinstance(response, dict) else first_message_id
         last_id = shown_id
         pending: list[dict[str, Any]] = []
         rounds = self._memory_rounds(
@@ -549,8 +550,9 @@ class StreamingMixin:
         try:
             async with contextlib.aclosing(rounds):
                 async for frame in rounds:
-                    if isinstance(frame, str):
-                        last_id = frame
+                    if isinstance(frame, str):  # the next round started: upstream took
+                        last_id = frame  # the previous round's results
+                        pending = []
                     elif isinstance(frame, list):
                         pending = frame
                     else:
@@ -618,6 +620,30 @@ class StreamingMixin:
             # round could not be reconstructed. Only the proxy's own calls: a
             # memory-named tool the client declared is the client's to run.
             memory_calls = memory_filter.hidden_calls()
+
+            def answers(
+                results: list[dict[str, Any]], calls: list[Any] = memory_calls
+            ) -> list[dict[str, Any]]:
+                """One tool_result per hidden call: its result, else an error result."""
+                done = {r.get("tool_use_id"): r for r in results if isinstance(r, dict)}
+                return [
+                    done.get(c["id"])
+                    or {
+                        "type": "tool_result",
+                        "tool_use_id": c["id"],
+                        "content": "Memory tool result unavailable.",
+                        "is_error": True,
+                    }
+                    for c in calls
+                    if isinstance(c, dict) and isinstance(c.get("id"), str)
+                ]
+
+            if thread_forwarded is not None and memory_calls:
+                # Upstream already stores this round with its memory tool_use. Until the
+                # next round's message_start proves the results were accepted, keep an
+                # answer for the next continue: errors first (execution or the send may
+                # be cancelled or fail), the real results once they exist.
+                yield answers([])
             tool_results: list[dict[str, Any]] = []
             if memory_calls and memory_user_id is not None and self.memory_handler is not None:
                 tool_results = await self.memory_handler.handle_memory_tool_calls(
@@ -626,6 +652,8 @@ class StreamingMixin:
                     "anthropic",
                     request_context=memory_request_ctx,
                 )
+            if thread_forwarded is not None and memory_calls:
+                yield answers(tool_results)
             logger.info(
                 f"[{request_id}] Memory: Executed {len(tool_results)}/"
                 f"{len(memory_filter.hidden_tool_names)} proxy-handled tool call(s) "
@@ -643,20 +671,6 @@ class StreamingMixin:
                 and rounds < self._MEMORY_CONTINUATION_MAX_ROUNDS
             )
             if not can_continue:
-                if thread_forwarded is not None and memory_calls:
-                    # Upstream stores this round's memory tool_use; answer every call.
-                    done = {r.get("tool_use_id"): r for r in tool_results if isinstance(r, dict)}
-                    yield [
-                        done.get(c.get("id"))
-                        or {
-                            "type": "tool_result",
-                            "tool_use_id": c.get("id"),
-                            "content": "Memory tool result unavailable.",
-                            "is_error": True,
-                        }
-                        for c in memory_calls
-                        if isinstance(c, dict) and isinstance(c.get("id"), str)
-                    ]
                 if memory_filter.visible_tool_use:
                     logger.info(
                         f"[{request_id}] Memory: Round also called a client tool; "
@@ -1616,6 +1630,10 @@ class StreamingMixin:
                     _thread_forwarded = thread_pinned_of(
                         body, thread_inherited, server_memory_tool_names
                     )
+                    # Round one's id from its message_start: known even when the round
+                    # is too big to rebuild (the memory rounds key their alias on it).
+                    _first_message_id: str | None = None
+                    _first_rest = b""
                     async for chunk in response.aiter_bytes():
                         sse_chunk_index += 1
                         if provider == "anthropic":
@@ -1624,6 +1642,10 @@ class StreamingMixin:
                             _sse_rest = _record_tool_names(
                                 thread_scope, _sse_rest + chunk, _thread_forwarded
                             )
+                            if _first_message_id is None:
+                                _first_message_id, _first_rest = message_id_from_sse(
+                                    _first_rest + chunk
+                                )
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -1753,6 +1775,7 @@ class StreamingMixin:
                             request_id=request_id,
                             thread_scope=thread_scope,
                             thread_forwarded=_thread_forwarded,
+                            first_message_id=_first_message_id,
                         ):
                             yield frame
                         memory_filter = None
@@ -1798,6 +1821,7 @@ class StreamingMixin:
                         request_id=request_id,
                         thread_scope=thread_scope,
                         thread_forwarded=_thread_forwarded,
+                        first_message_id=_first_message_id,
                     ):
                         yield frame
 

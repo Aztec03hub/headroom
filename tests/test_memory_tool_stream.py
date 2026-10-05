@@ -424,7 +424,7 @@ class TestThreadMemoryRounds:
         )
         await self._thread_stream(proxy, "scope-pend", memory_user_id="user-1")
         assert tool_name_registry.resolve_thread_alias("scope-pend", "msg_1") == "msg_mixed2"
-        assert tool_name_registry.pop_pending_results("scope-pend", "msg_mixed2") == result2
+        assert tool_name_registry.pending_results("scope-pend", "msg_mixed2") == result2
 
     @pytest.mark.asyncio
     async def test_memory_calls_without_a_result_get_an_error_result_on_a_thread(self) -> None:
@@ -432,8 +432,52 @@ class TestThreadMemoryRounds:
 
         proxy = _proxy([_sse([SAVE, BASH], "tool_use")], [])  # the memory backend returned nothing
         await self._thread_stream(proxy, "scope-nouser", memory_user_id="user-1")
-        pending = tool_name_registry.pop_pending_results("scope-nouser", "msg_1")
+        pending = tool_name_registry.pending_results("scope-nouser", "msg_1")
         assert [(r["tool_use_id"], r.get("is_error")) for r in pending] == [("toolu_mem", True)]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_continuation_round_keeps_the_answers_for_round_one(self) -> None:
+        """Round one is stored upstream with its memory tool_use; the round that would
+        have answered it failed, so the next continue must carry the answer."""
+        from headroom import tool_name_registry
+
+        proxy = _proxy([_sse([TEXT, SAVE], "tool_use")], SAVE_RESULT)
+        failed = MagicMock()
+        failed.status_code = 529
+        failed.aread = AsyncMock(return_value=b'{"type":"error"}')
+        failed.aclose = AsyncMock()
+        first = proxy.http_client.send.side_effect
+        proxy.http_client.send = AsyncMock(side_effect=[next(iter(first)), failed])
+        await self._thread_stream(proxy, "scope-fail", memory_user_id="user-1")
+        assert tool_name_registry.resolve_thread_alias("scope-fail", "msg_1") == "msg_1"
+        assert tool_name_registry.pending_results("scope-fail", "msg_1") == SAVE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_answers_are_dropped_once_the_next_round_starts(self) -> None:
+        from headroom import tool_name_registry
+
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([TEXT], "end_turn").replace(b'"msg_1"', b'"msg_ok2"'),
+            ],
+            SAVE_RESULT,
+        )
+        await self._thread_stream(proxy, "scope-ok", memory_user_id="user-1")
+        assert tool_name_registry.pending_results("scope-ok", "msg_1") == []
+        assert tool_name_registry.pending_results("scope-ok", "msg_ok2") == []
+
+    @pytest.mark.asyncio
+    async def test_round_one_too_big_to_rebuild_still_keys_its_answers(self, monkeypatch) -> None:  # noqa: ANN001
+        from headroom import tool_name_registry
+
+        monkeypatch.setattr("headroom.proxy.helpers.MAX_SSE_BUFFER_SIZE", 500)
+        big = {"type": "text", "text": "x" * 2000}
+        proxy = _proxy([_sse([big, SAVE, BASH], "tool_use")], SAVE_RESULT)
+        await self._thread_stream(proxy, "scope-big1", memory_user_id="user-1")
+        assert [
+            r["tool_use_id"] for r in tool_name_registry.pending_results("scope-big1", "msg_1")
+        ] == ["toolu_mem"]
 
     @pytest.mark.asyncio
     async def test_no_alias_without_a_thread(self) -> None:

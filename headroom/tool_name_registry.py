@@ -143,11 +143,13 @@ def record_pending_results(scope: str, message_id: str, results: list[dict[str, 
             _pending.popitem(last=False)
 
 
-def pop_pending_results(scope: str, message_id: object) -> list[dict[str, Any]]:
+def pending_results(scope: str, message_id: object) -> list[dict[str, Any]]:
+    """Kept, not consumed: a client retry, or any other continue from that message,
+    needs the same answers; the entry ages out of the bounded map."""
     if not isinstance(message_id, str):
         return []
     with _lock:
-        return _pending.pop((scope, message_id), [])
+        return list(_pending.get((scope, message_id), []))
 
 
 def message_id_from_sse(data: bytes) -> tuple[str | None, bytes]:
