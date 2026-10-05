@@ -480,6 +480,21 @@ class TestThreadMemoryRounds:
         ] == ["toolu_mem"]
 
     @pytest.mark.asyncio
+    async def test_a_memory_call_cut_off_mid_input_still_gets_an_answer(self) -> None:
+        """max_tokens inside the call's input: it never runs, but the stored message may
+        hold the tool_use, so the next continue answers it with an error result."""
+        from headroom import tool_name_registry
+
+        cut = _sse([TEXT, SAVE], "max_tokens")
+        full = json.dumps(json.dumps(SAVE["input"]))[1:-1].encode()
+        assert full in cut
+        proxy = _proxy([cut.replace(full, full[:10])], SAVE_RESULT)
+        await self._thread_stream(proxy, "scope-cut", memory_user_id="user-1")
+        pending = tool_name_registry.pending_results("scope-cut", "msg_1")
+        assert [(r["tool_use_id"], r.get("is_error")) for r in pending] == [("toolu_mem", True)]
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_no_alias_without_a_thread(self) -> None:
         from headroom import tool_name_registry
 

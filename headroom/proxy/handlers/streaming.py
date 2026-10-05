@@ -529,7 +529,7 @@ class StreamingMixin:
 
         # The client keeps round one's message id (its message_start is the only one
         # forwarded); on a Thread turn the next continue must name the LAST round's.
-        shown_id = response.get("id") if isinstance(response, dict) else first_message_id
+        shown_id = (response.get("id") if isinstance(response, dict) else None) or first_message_id
         last_id = shown_id
         pending: list[dict[str, Any]] = []
         rounds = self._memory_rounds(
@@ -621,24 +621,26 @@ class StreamingMixin:
             # memory-named tool the client declared is the client's to run.
             memory_calls = memory_filter.hidden_calls()
 
+            hidden_ids = memory_filter.hidden_ids()
+
             def answers(
-                results: list[dict[str, Any]], calls: list[Any] = memory_calls
+                results: list[dict[str, Any]], ids: list[str] = hidden_ids
             ) -> list[dict[str, Any]]:
-                """One tool_result per hidden call: its result, else an error result."""
+                """One tool_result per withheld call (also one cut off mid-input, which
+                never runs): its result, else an error result."""
                 done = {r.get("tool_use_id"): r for r in results if isinstance(r, dict)}
                 return [
-                    done.get(c["id"])
+                    done.get(i)
                     or {
                         "type": "tool_result",
-                        "tool_use_id": c["id"],
+                        "tool_use_id": i,
                         "content": "Memory tool result unavailable.",
                         "is_error": True,
                     }
-                    for c in calls
-                    if isinstance(c, dict) and isinstance(c.get("id"), str)
+                    for i in ids
                 ]
 
-            if thread_forwarded is not None and memory_calls:
+            if thread_forwarded is not None and hidden_ids:
                 # Upstream already stores this round with its memory tool_use. Until the
                 # next round's message_start proves the results were accepted, keep an
                 # answer for the next continue: errors first (execution or the send may
@@ -652,7 +654,7 @@ class StreamingMixin:
                     "anthropic",
                     request_context=memory_request_ctx,
                 )
-            if thread_forwarded is not None and memory_calls:
+            if thread_forwarded is not None and hidden_ids:
                 yield answers(tool_results)
             logger.info(
                 f"[{request_id}] Memory: Executed {len(tool_results)}/"
