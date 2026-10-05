@@ -1204,21 +1204,30 @@ def test_non_continue_still_uses_the_tracker_store(monkeypatch) -> None:  # noqa
     assert store_calls and "frozen_message_count" not in captured
 
 
-def test_response_cache_key_includes_thread() -> None:
+def test_thread_requests_bypass_the_response_cache() -> None:
     captured: dict = {}
     delta = [
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}
     ]
+    hi = [{"role": "user", "content": "hi"}]
     with _client(cache_enabled=True) as client:
         proxy = client.app.state.proxy
         proxy.config.mode = "token"
         _instrument(proxy, captured)
-        a = _continue_body(delta)
-        b = _continue_body(delta)
-        b["thread"] = {"type": "continue", "previous_message_id": "msg_OTHER"}
-        assert _post(client, a).status_code == 200
-        assert _post(client, b).status_code == 200
-    assert captured["calls"] == 2, "different threads must not share a cached response"
+        create = _continue_body(hi)
+        create["thread"] = {"type": "create"}
+        for body in (create, create, _continue_body(delta), _continue_body(delta)):
+            assert _post(client, body).status_code == 200
+        assert captured["calls"] == 4, "identical Thread requests must each reach upstream"
+        assert not proxy.cache._cache, "a Thread response must never be stored"
+        plain = _continue_body(hi)
+        del plain["thread"]
+        for _ in range(2):
+            assert _post(client, plain).status_code == 200
+        # The control lands in the same store, so the empty check above was real.
+        assert len(proxy.cache._cache) == 1
+    # Control: the cache is live, so the identical non-thread request hits it.
+    assert captured["calls"] == 5
 
 
 # 6. tool-name registry -----------------------------------------------------

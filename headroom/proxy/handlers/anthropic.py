@@ -1481,10 +1481,6 @@ class AnthropicHandlerMixin:
                 "stop": body.get("stop_sequences"),
                 "thinking": body.get("thinking"),
                 "output_config": body.get("output_config"),
-                # Thread continue bodies are tiny deltas; without the thread
-                # two conversations sending the same delta would share a key.
-                # Only when present: every non-thread key stays what it was.
-                **({"thread": body["thread"]} if "thread" in body else {}),
             }
             # Snapshot the lookup messages too. `messages` is the primary cache
             # key component, but it is reassigned below by the security scan, the
@@ -1500,8 +1496,14 @@ class AnthropicHandlerMixin:
             # the principal could not be established: skip the cache entirely.
             # Only resolved when the cache can be used, so streaming and
             # cache-disabled requests never pay for identity resolution.
+            # A Thread request is never served from or stored in the cache: its
+            # response id creates or extends server-stored state, so a replayed
+            # reply would hand back an existing thread instead of a new one, or
+            # an old reply instead of a new branch.
             cache_partition = (
-                compute_request_cache_partition(request) if self.cache and not stream else None
+                compute_request_cache_partition(request)
+                if self.cache and not stream and "thread" not in body
+                else None
             )
             # Check cache (non-streaming only)
             cache_hit = False
