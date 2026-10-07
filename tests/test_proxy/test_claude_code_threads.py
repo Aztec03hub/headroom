@@ -1161,7 +1161,7 @@ def test_continue_forces_frozen_count_zero_and_bypasses_tracker_store() -> None:
         store = proxy.session_tracker_store
         store.compute_session_id = lambda request, model, messages: "sess"
 
-        def _fake_get(session_id, provider):  # noqa: ANN001
+        def _fake_get(session_id, provider, cache_ttl_seconds=None):  # noqa: ANN001
             store_calls.append(session_id)
             return _FakeTracker()
 
@@ -1191,7 +1191,7 @@ def test_non_continue_still_uses_the_tracker_store(monkeypatch) -> None:  # noqa
         store = proxy.session_tracker_store
         store.compute_session_id = lambda request, model, messages: "sess"
 
-        def _fake_get(session_id, provider):  # noqa: ANN001
+        def _fake_get(session_id, provider, cache_ttl_seconds=None):  # noqa: ANN001
             store_calls.append(session_id)
             return _FakeTracker()
 
